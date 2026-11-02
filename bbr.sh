@@ -5,7 +5,7 @@ export PATH
 #=================================================
 #   System  : Debian 12 / 13 and later
 #   Desc    : BBR一键加速 + TCP深度调优
-#   Version : 3.0.0-debian
+#   Version : 3.1.0-debian
 #   Author  : VPS值得买
 #   测评网站    : https://vpszdm.com
 #=================================================
@@ -19,7 +19,7 @@ CYAN='\033[0;96m'
 BOLD='\033[1m'
 PLAIN='\033[0m'
 
-sh_ver="3.0.0-debian"
+sh_ver="3.1.0-debian"
 
 # ────────────────────────── 通用工具函数 ──────────────────────────
 info()    { echo -e "${BLUE}[INFO]${PLAIN}  $*"; }
@@ -64,11 +64,11 @@ backup_file() {
 
 # ────────────────────────── 依赖检查与安装 ──────────────────────────
 check_dependencies() {
-    local deps=() dep
-    for dep in curl; do
-        command -v "$dep" &>/dev/null || deps+=("$dep")
-    done
-    [[ -f /etc/ssl/certs/ca-certificates.crt ]] || deps+=(ca-certificates)
+    local deps=()
+    command -v sysctl &>/dev/null || deps+=(procps)
+    if ! command -v ip &>/dev/null || ! command -v ss &>/dev/null || ! command -v tc &>/dev/null; then
+        deps+=(iproute2)
+    fi
     if (( ${#deps[@]} )); then
         apt-get update && apt-get install -y "${deps[@]}" || return 1
     fi
@@ -168,11 +168,10 @@ sysctl_apply_file() {
 
         # 尝试写入，捕获错误
         local err
-        err=$(sysctl -w "${key}=${value}" 2>&1)
-        if [[ $? -ne 0 ]]; then
+        if ! err=$(sysctl -w "${key}=${value}" 2>&1); then
             # 报告失败并继续处理其他参数（容器内常见）
             warn "跳过不支持的参数: ${key} (${err})"
-            (( skipped++ ))
+            skipped=$((skipped + 1))
         fi
     done < "$conf_file"
 
@@ -193,20 +192,7 @@ enable_bbr() {
 net.core.default_qdisc         = fq
 net.ipv4.tcp_congestion_control = bbr
 
-# ── 发送 / 接收缓冲区 ──
-net.core.rmem_max               = 33554432
-net.core.wmem_max               = 33554432
-net.ipv4.tcp_rmem               = 4096 87380 33554432
-net.ipv4.tcp_wmem               = 4096 65536 33554432
 
-# ── 连接队列 ──
-net.core.netdev_max_backlog     = 10000
-net.ipv4.tcp_max_syn_backlog    = 8192
-net.core.somaxconn              = 8192
-
-# ── TCP 快速选项 ──
-net.ipv4.tcp_fastopen           = 3
-net.ipv4.tcp_slow_start_after_idle = 0
 EOF
 
     # 使用兼容方式逐条写入（兼容 LXC/Docker 等容器环境）
@@ -239,118 +225,206 @@ EOF
     fi
 }
 
-# ────────────────────────── TCP 深度调优 ──────────────────────────
+# 只读诊断：不测速、不扫描第三方节点、不读取代理账号或证书。
+parse_socket_rtts() {
+    awk '
+        /^[^ \t]/ && !/rtt:/ {
+            skip = ($0 ~ /(^|[ \t])(127\.|\[?::1\]?:|\[?::ffff:127\.)/)
+            next
+        }
+        !skip {
+            for (i=1; i<=NF; i++) if ($i ~ /^rtt:[0-9]/) {
+                split($i, p, ":"); split(p[2], r, "/")
+                if (r[1]+0 > 0) print r[1]+0
+            }
+        }'
+}
+
+rtt_summary() {
+    sort -n | awk '{a[NR]=$1} END {
+        if (NR) printf "%d %.3f %.3f\n", NR, a[int((NR+1)/2)], a[int((NR*3+3)/4)]
+        else print "0 0 0"
+    }'
+}
+
+valid_measurement() {
+    [[ "$1" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 1
+    awk -v n="$1" -v max="$2" 'BEGIN {exit !(n>0 && n<=max)}'
+}
+
+effective_memory() {
+    local total available limit used f
+    read -r total available < <(awk '
+        /^MemTotal:/ {t=int($2/1024)} /^MemAvailable:/ {a=int($2/1024)}
+        END {print t+0, a+0}' /proc/meminfo)
+    # 容器内 /proc/meminfo 可能显示宿主机内存，优先收紧到可读的 cgroup 限制。
+    for f in /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory/memory.limit_in_bytes; do
+        [[ -r "$f" ]] || continue
+        read -r limit < "$f"
+        [[ "$limit" =~ ^[0-9]+$ ]] || continue
+        # 使用 awk 避免 v1 的超大 unlimited 值溢出 shell 算术。
+        if awk -v l="$limit" -v t="$total" 'BEGIN {exit !(l>0 && l/1048576<t)}'; then
+            used=0
+            if [[ "$f" == */memory.max && -r /sys/fs/cgroup/memory.current ]]; then
+                read -r used < /sys/fs/cgroup/memory.current
+            elif [[ -r /sys/fs/cgroup/memory/memory.usage_in_bytes ]]; then
+                read -r used < /sys/fs/cgroup/memory/memory.usage_in_bytes
+            fi
+            read -r total available < <(awk -v l="$limit" -v u="$used" -v a="$available" 'BEGIN {
+                t=int(l/1048576); free=int((l-u)/1048576); if(free<0) free=0
+                if(free<a) a=free; print t,a
+            }')
+        fi
+    done
+    printf '%s %s\n' "$total" "$available"
+}
+
+recommend_buffer_mib() {
+    # 工程启发式，不是 BBR 算法参数：内存约束 + 约 2 倍带宽时延积。
+    # 参数均由内部检测或通过校验的数值提供；用 awk 避免输入进入 shell 算术表达式。
+    awk -v total="$1" -v free="$2" -v bw="$3" -v rtt="$4" 'BEGIN {
+        cap=8
+        if(total>=512 && free>=128) cap=16
+        if(total>=1024 && free>=256) cap=32
+        if(total>=2048 && free>=512) cap=64
+        if(total>=4096 && free>=1024) cap=128
+        result=(cap<32 ? cap : 32)
+        if(bw>0 && rtt>0) {
+            need=2*bw*rtt*125/1048576
+            while(result<need && result<cap) result*=2
+        }
+        if(result>cap) result=cap
+        print result
+    }'
+}
+
+detect_network() {
+    local port="$1" dev="" speed="" sample
+    read -r DETECT_TOTAL_MIB DETECT_FREE_MIB < <(effective_memory)
+    info "有效内存: ${DETECT_TOTAL_MIB} MiB；可用估计: ${DETECT_FREE_MIB} MiB"
+    info "CPU: $(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 未知)；内核: $(uname -r)"
+    dev=$(ip -o route show default 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="dev") {print $(i+1); exit}}')
+    [[ -n "$dev" ]] || dev=$(ip -o -6 route show default 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="dev") {print $(i+1); exit}}')
+    if [[ -n "$dev" ]]; then
+        info "默认出口: $dev（多出口/策略路由时不一定对应所有客户端）"
+        if [[ -r "/sys/class/net/$dev/speed" ]]; then
+            speed=$(cat "/sys/class/net/$dev/speed" 2>/dev/null) || speed=""
+            [[ "$speed" =~ ^[0-9]+$ ]] && info "网卡报告速率: $speed Mbps，仅供参考，不当作实际带宽"
+        fi
+        ip -s link show dev "$dev" 2>/dev/null || true
+        info "实际网卡队列（只查看，不替换已有 mq/整形配置）："
+        tc qdisc show dev "$dev" 2>/dev/null || true
+    else
+        warn "未检测到默认出口；不会据此猜测线路质量"
+    fi
+    info "读取本机 TCP $port 入站已建立连接的一次 RTT 快照（排除回环）..."
+    if sample=$(ss -Htin state established "( sport = :$port )" 2>/dev/null); then
+        read -r DETECT_SAMPLES DETECT_MEDIAN_MS DETECT_P75_MS < <(printf '%s\n' "$sample" | parse_socket_rtts | rtt_summary)
+    else
+        DETECT_SAMPLES=0 DETECT_MEDIAN_MS=0 DETECT_P75_MS=0
+        warn "ss 读取失败，按无样本处理"
+    fi
+    info "RTT 样本 ${DETECT_SAMPLES} 个；中位数 ${DETECT_MEDIAN_MS} ms；P75 ${DETECT_P75_MS} ms"
+    echo "这是 TCP 平滑 RTT，不是三网测速或丢包率；同端口也可能包含网站访问。"
+    echo "不采集客户端 IP 到报告，不读取 Xray/Nginx 配置。建议让国内客户端连接并传输后重试。"
+}
+
+write_adaptive_config() {
+    local bytes="$1"
+    [[ "$bytes" =~ ^[0-9]+$ ]] || return 1
+    cat <<EOF
+# Debian BBR 自适应 TCP 配置；上限由内存与可选 BDP 估算决定。
+# 不修改 BBR 内部增益，不承诺三网最优；不替换实际网卡队列。
+net.core.rmem_max = $bytes
+net.core.wmem_max = $bytes
+net.ipv4.tcp_rmem = 4096 131072 $bytes
+net.ipv4.tcp_wmem = 4096 65536 $bytes
+net.ipv4.tcp_moderate_rcvbuf = 1
+net.ipv4.tcp_no_metrics_save = 0
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_sack = 1
+net.ipv4.tcp_timestamps = 1
+net.ipv4.tcp_window_scaling = 1
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_slow_start_after_idle = 0
+EOF
+}
+
 tcp_tune() {
     hr
-    info "正在应用 TCP 深度调优..."
-    echo ""
-    echo -e "${YELLOW}  本操作将优化以下参数：${PLAIN}"
-    echo "    • TIME_WAIT 连接回收与复用"
-    echo "    • TCP 连接保活 (keepalive)"
-    echo "    • MTU 探测 & PMTU"
-    echo "    • 本地端口范围扩展"
-    echo "    • SYN Cookie 防 SYN Flood"
-    echo "    • 连接追踪表 (nf_conntrack)"
-    echo "    • 文件描述符上限
-    固定参数不保证提速；容器中部分参数可能被宿主机限制。"
-    echo ""
-    read -rp "  确认写入? [y/N]: " confirm_tune
-    [[ ! "$confirm_tune" =~ ^[Yy]$ ]] && { warn "已取消"; return; }
-
-    backup_file /etc/sysctl.d/99-tcp-tune.conf || return 1
-    backup_file /etc/security/limits.conf || return 1
-    mkdir -p /etc/sysctl.d || return 1
-    cat > /etc/sysctl.d/99-tcp-tune.conf <<'EOF' || return 1
-# ════════════════════════════════════════════
-#   TCP 深度调优 - by VPS值得买
-#   https://vpszdm.com
-# ════════════════════════════════════════════
-
-# ── TIME_WAIT ──────────────────────────────
-# 允许复用符合内核安全条件的 TIME_WAIT 连接
-net.ipv4.tcp_tw_reuse           = 1
-# TIME_WAIT 最大数量，超出直接丢弃
-net.ipv4.tcp_max_tw_buckets     = 20000
-
-# ── 连接保活 ───────────────────────────────
-# 空闲 60s 后开始发送 keepalive 探测包
-net.ipv4.tcp_keepalive_time     = 60
-# 探测间隔 10s
-net.ipv4.tcp_keepalive_intvl    = 10
-# 最多探测 6 次无响应则断开
-net.ipv4.tcp_keepalive_probes   = 6
-
-# ── SYN 握手 ───────────────────────────────
-# SYN Cookie 防 SYN Flood
-net.ipv4.tcp_syncookies         = 1
-# SYN 重试次数
-net.ipv4.tcp_syn_retries        = 3
-net.ipv4.tcp_synack_retries     = 3
-# SYN 等待队列
-net.ipv4.tcp_max_syn_backlog    = 8192
-net.core.somaxconn              = 8192
-
-# ── 端口范围 ───────────────────────────────
-net.ipv4.ip_local_port_range    = 1024 65535
-
-# ── MTU 探测（推荐开启，减少分片）──────────
-net.ipv4.tcp_mtu_probing        = 1
-
-# ── 内存与缓冲区 ───────────────────────────
-net.core.rmem_default           = 262144
-net.core.wmem_default           = 262144
-net.core.rmem_max               = 33554432
-net.core.wmem_max               = 33554432
-net.ipv4.tcp_rmem               = 4096 87380 33554432
-net.ipv4.tcp_wmem               = 4096 65536 33554432
-
-# ── 连接队列/网卡接收队列 ──────────────────
-net.core.netdev_max_backlog     = 10000
-
-# ── TCP 选项 ───────────────────────────────
-# 启用 TCP Fast Open
-net.ipv4.tcp_fastopen           = 3
-# 关闭空闲后慢启动（提升长肥管道性能）
-net.ipv4.tcp_slow_start_after_idle = 0
-# 选择性确认（提升丢包恢复效率）
-net.ipv4.tcp_sack               = 1
-# 时间戳（配合 tw_reuse 使用）
-net.ipv4.tcp_timestamps         = 1
-# 窗口扩展（大带宽必备）
-net.ipv4.tcp_window_scaling     = 1
-# 不保存连接的 TCP 路径度量
-net.ipv4.tcp_no_metrics_save    = 1
-
-# ── 连接追踪表（如有 nf_conntrack 模块）──────
-net.netfilter.nf_conntrack_max              = 1000000
-net.netfilter.nf_conntrack_tcp_timeout_established = 7200
-
-# ── 文件描述符 ─────────────────────────────
-fs.file-max                     = 1000000
-EOF
-
-    # 使用兼容方式逐条写入（自动跳过不支持的参数）
-    sysctl_apply_file /etc/sysctl.d/99-tcp-tune.conf || warn "部分配置未生效，请查看上面的错误"
-
-    # 提升系统文件描述符限制（持久化）
-    if ! grep -q "# tcp-tune" /etc/security/limits.conf 2>/dev/null; then
-        cat >> /etc/security/limits.conf <<'EOF' || return 1
-
-# tcp-tune: 提升文件描述符限制
-* soft nofile 1000000
-* hard nofile 1000000
-root soft nofile 1000000
-root hard nofile 1000000
-EOF
+    echo "直连 VLESS + WS/XHTTP + TLS：先诊断，再预览，确认后才写入。"
+    echo "XHTTP 使用 H3/QUIC 时，TCP 调优不直接控制该 UDP 传输；CDN 场景 RTT 也不代表国内客户端。"
+    local port topology bw rtt manual cap bytes confirm preview state_dir key value
+    read -rp "公网 TLS/TCP 入站端口 [443]: " port || return 0
+    port=${port:-443}
+    [[ "$port" =~ ^[0-9]{1,5}$ ]] && (( 10#$port >= 1 && 10#$port <= 65535 )) || { error "端口无效"; return 1; }
+    port=$((10#$port))
+    read -rp "连接方式 [1=直连，2=CDN/不确定；默认1]: " topology || return 0
+    topology=${topology:-1}
+    [[ "$topology" == 1 || "$topology" == 2 ]] || { error "选项无效"; return 1; }
+    detect_network "$port"
+    echo "套餐带宽只作为估算输入；不要填虚拟网卡速率或把共享峰值当保底。"
+    read -rp "预计分配给单条代理连接的带宽 Mbps [留空=未知]: " bw || return 0
+    if [[ -n "$bw" ]]; then
+        valid_measurement "$bw" 100000 || { error "带宽应为 0 到 100000 之间的正数"; return 1; }
+    else
+        bw=0
     fi
+    rtt=0
+    if [[ "$topology" == 1 ]] && (( DETECT_SAMPLES >= 5 )); then
+        rtt=$DETECT_P75_MS
+        info "直连样本达到 5 个，使用当前快照的 P75 RTT 估算（非运营商分类）"
+    else
+        warn "无足够直连样本，或连接经过 CDN，不自动用该 RTT 放大缓冲区"
+    fi
+    read -rp "可填写从国内客户端测得的 TCP RTT 毫秒 [留空=沿用可用样本/未知]: " manual || return 0
+    if [[ -n "$manual" ]]; then
+        valid_measurement "$manual" 10000 || { error "RTT 应为 0 到 10000 之间的正数"; return 1; }
+        if [[ "$topology" == 1 ]]; then
+            rtt=$manual
+        else
+            warn "CDN 场景客户端 RTT 不等于回源 RTT；本次不用于计算源站 TCP 缓冲区"
+        fi
+    fi
+    cap=$(recommend_buffer_mib "$DETECT_TOTAL_MIB" "$DETECT_FREE_MIB" "$bw" "$rtt")
+    bytes=$((cap * 1048576))
+    info "建议每个方向缓冲区上限: $cap MiB；BW=$bw Mbps，估算 RTT=$rtt ms（0=未知/不使用）"
+    echo "这是试验上限，不会预分配给每条连接；高并发仍可能增加内存压力。"
+    echo "算法依据：约 2 倍带宽时延积，按内存余量封顶 8/16/32/64/128 MiB；未知线路不主动升档。"
+    echo "以下是将写入的完整配置："
+    preview=$(write_adaptive_config "$bytes") || return 1
+    printf '%s\n' "$preview"
+    echo "不修改 Xray/Nginx、路由、端口范围、conntrack、文件上限或 SYN 重试。"
+    echo "旧版已修改的其他运行值不会因移除旧配置而立即复原；需要按原备份恢复或重启后核对。"
+    read -rp "备份并应用上述配置? [y/N]: " confirm || return 0
+    [[ "$confirm" =~ ^[Yy]$ ]] || { info "已取消，未写入调优配置"; return 0; }
 
-    echo ""
-    echo -e "${GREEN}  ┌─────────────────────────────────────────────────┐${PLAIN}"
-    echo -e "${GREEN}  │  ✅  TCP 调优已尝试应用，请检查输出                         │${PLAIN}"
-    echo -e "${GREEN}  │     配置文件: /etc/sysctl.d/99-tcp-tune.conf    │${PLAIN}"
-    echo -e "${GREEN}  │     sysctl 即时应用，登录限制需重新登录                       │${PLAIN}"
-    echo -e "${GREEN}  └─────────────────────────────────────────────────┘${PLAIN}"
-    echo ""
+    state_dir=$(mktemp -d /var/backups/debian-bbr-tune.XXXXXXXX) || return 1
+    if [[ -e /etc/sysctl.d/99-tcp-tune.conf ]]; then
+        cp -a /etc/sysctl.d/99-tcp-tune.conf "$state_dir/" || return 1
+    else
+        touch "$state_dir/no-previous-tcp-config" || return 1
+    fi
+    while IFS='=' read -r key _; do
+        [[ "$key" == \#* || -z "$key" ]] && continue
+        key=${key// /}
+        if value=$(sysctl -n "$key" 2>/dev/null); then
+            printf '%s = %s\n' "$key" "$value" >> "$state_dir/runtime-before.conf" || return 1
+        fi
+    done <<< "$preview"
+    printf 'port=%s\ntopology=%s\nsamples=%s\nrtt_median_ms=%s\nrtt_p75_ms=%s\nchosen_rtt_ms=%s\nbandwidth_mbps=%s\nbuffer_mib=%s\n' \
+        "$port" "$topology" "$DETECT_SAMPLES" "$DETECT_MEDIAN_MS" "$DETECT_P75_MS" "$rtt" "$bw" "$cap" > "$state_dir/report.txt" || return 1
+    mkdir -p /etc/sysctl.d || return 1
+    printf '%s\n' "$preview" > /etc/sysctl.d/99-tcp-tune.conf || return 1
+    info "配置与运行值备份：$state_dir"
+    if sysctl_apply_file /etc/sysctl.d/99-tcp-tune.conf; then
+        ok "全部目标参数已应用。请从国内客户端比较单连接吞吐、加载延迟和重传。"
+    else
+        warn "部分参数失败；配置已保存，请检查上方错误，不能视为全部生效。"
+        return 1
+    fi
+    echo "恢复本次涉及的运行值：sysctl -p $state_dir/runtime-before.conf"
+    echo "恢复持久配置：有旧文件时将备份复制回原路径；标记 no-previous-tcp-config 表示原先没有此文件。"
 }
 
 # 仅使用当前 Debian 已配置的软件源，不更换源，不安装第三方内核。
@@ -436,7 +510,7 @@ show_menu() {
         banner
         show_status
         echo "1. 启用 BBR"
-        echo "2. TCP 深度调优"
+        echo "2. 网络检测 + 自适应 TCP 调优（直连 WS/XHTTP）"
         echo "3. 更新 Debian 内核"
         echo "4. 清理旧内核（保留当前及最新两个）"
         echo "5. 查看状态"
