@@ -5,36 +5,82 @@ export PATH
 #=================================================
 #   System  : Debian 12 / 13 and later
 #   Desc    : BBR一键加速 + TCP深度调优
-#   Version : 3.2.0-debian
+#   Version : 3.3.0-debian
 #   Author  : VPS值得买
 #   测评网站    : https://vpszdm.com
 #=================================================
 
-# ────────────────────────── 颜色定义 ──────────────────────────
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-BLUE='\033[0;36m'
-CYAN='\033[0;96m'
-BOLD='\033[1m'
-PLAIN='\033[0m'
+# 终端显示：交互终端自动启用颜色，日志/重定向默认纯文本。
+ui_init() {
+    RED='' GREEN='' YELLOW='' BLUE='' CYAN='' BOLD='' DIM='' PLAIN=''
+    UI_COLUMNS=${COLUMNS:-}
+    if [[ -t 1 ]] && command -v stty &>/dev/null; then
+        local terminal_rows terminal_columns
+        read -r terminal_rows terminal_columns < <(stty size 2>/dev/null) || true
+        if [[ "$terminal_columns" =~ ^[0-9]{2,3}$ ]]; then UI_COLUMNS=$terminal_columns; fi
+    fi
+    if [[ -z ${NO_COLOR+x} && ${TERM:-dumb} != dumb ]] &&
+       { [[ -t 1 ]] || [[ ${BBR_COLOR:-auto} == always ]]; }; then
+        RED=$'\033[31m' GREEN=$'\033[32m' YELLOW=$'\033[33m'
+        BLUE=$'\033[36m' CYAN=$'\033[96m' BOLD=$'\033[1m'
+        DIM=$'\033[90m' PLAIN=$'\033[0m'
+    fi
+}
+ui_init
 
-sh_ver="3.2.0-debian"
+sh_ver="3.3.0-debian"
 
-# ────────────────────────── 通用工具函数 ──────────────────────────
-info()    { echo -e "${BLUE}[INFO]${PLAIN}  $*"; }
-ok()      { echo -e "${GREEN}[  OK]${PLAIN}  $*"; }
-warn()    { echo -e "${YELLOW}[WARN]${PLAIN}  $*"; }
-error()   { echo -e "${RED}[FAIL]${PLAIN}  $*"; }
-die()     { error "$*"; exit 1; }
+ui_log() { printf '  %s[%s]%s %s\n' "$1" "$2" "$PLAIN" "$3"; }
+info()  { ui_log "$BLUE" '信息' "$*"; }
+ok()    { ui_log "$GREEN" '完成' "$*"; }
+warn()  { ui_log "$YELLOW" '提醒' "$*"; }
+skip()  { ui_log "$YELLOW" '跳过' "$*"; }
+error() { ui_log "$RED" '失败' "$*"; }
+die()   { error "$*"; exit 1; }
 
 hr() {
-    echo -e "${BLUE}──────────────────────────────────────────────────────${PLAIN}"
+    local width=68 i
+    if [[ ${UI_COLUMNS:-} =~ ^[0-9]{2,3}$ ]]; then
+        width=$((10#$UI_COLUMNS - 4))
+        if (( width < 32 )); then width=32; fi
+        if (( width > 68 )); then width=68; fi
+    fi
+    printf '  %s' "$DIM"
+    for (( i=0; i<width; i++ )); do printf '─'; done
+    printf '%s\n' "$PLAIN"
 }
 
+ui_detail() { printf '         %s\n' "$*"; }
+ui_kv()     { printf '  %s%s%s  %s\n' "$DIM" "$1" "$PLAIN" "$2"; }
+ui_section() {
+    printf '\n  %s%s%s\n' "$BOLD$CYAN" "$1" "$PLAIN"
+    hr
+}
+ui_step() { printf '\n  %s[%s/%s]%s %s\n' "$CYAN" "$1" "$2" "$PLAIN" "$3"; }
+ui_prompt() { printf '\n  %s›%s %s ' "$CYAN" "$PLAIN" "$1"; }
+
 banner() {
-    echo "BBR + TCP 调优 v${sh_ver} — Debian 12 / 13 及以上"
-    echo "基于 VPS值得买原脚本修改，原作者：https://vpszdm.com"
+    printf '\n'
+    hr
+    printf '  %sDEBIAN  /  BBR + TCP%s\n' "$BOLD$CYAN" "$PLAIN"
+    printf '  网络配置助手  %sv%s%s\n' "$DIM" "$sh_ver" "$PLAIN"
+    printf '\n  Debian 12 / 13 及以上 · TCP 自动适配\n'
+    printf '  %s基于 VPS值得买原脚本修改 · vpszdm.com%s\n' "$DIM" "$PLAIN"
+    hr
+}
+
+run_action() {
+    local title="$1"
+    shift
+    ui_section "$title"
+    if "$@"; then
+        printf '\n'
+        ui_detail '本次操作结束，结果见上方提示。'
+    else
+        printf '\n'
+        error '本次操作未全部完成，请查看上方原因。'
+        return 1
+    fi
 }
 
 is_supported_system() {
@@ -70,6 +116,8 @@ check_dependencies() {
         deps+=(iproute2)
     fi
     if (( ${#deps[@]} )); then
+        info "正在安装缺少的依赖：${deps[*]}"
+        ui_detail "软件包管理器输出如下；完成后会自动继续。"
         apt-get update && apt-get install -y "${deps[@]}" || return 1
     fi
 }
@@ -92,14 +140,11 @@ check_virt() {
     ok "虚拟化类型: ${BOLD}${virt_type}${PLAIN}"
 
     if [[ "$virt_type" == "openvz" ]]; then
-        echo ""
-        echo -e "${RED}  ┌─────────────────────────────────────────────────┐${PLAIN}"
-        echo -e "${RED}  │  ⚠  警告：检测到 OpenVZ 虚拟化                  │${PLAIN}"
-        echo -e "${RED}  │     OpenVZ 容器无法更换内核，无法启用 BBR        │${PLAIN}"
-        echo -e "${RED}  │     建议更换为 KVM / Xen 虚拟化的 VPS            │${PLAIN}"
-        echo -e "${RED}  └─────────────────────────────────────────────────┘${PLAIN}"
-        echo ""
-        read -rp "  是否继续（可能失败）? [y/N]: " continue_openvz
+        printf '\n'
+        warn '检测到 OpenVZ 容器，内核由宿主机管理。'
+        ui_detail 'BBR 是否可用取决于宿主机支持与容器权限。'
+        ui_detail '本脚本可能无法修改相关参数。'
+        read -rp "$(ui_prompt '仍要继续吗？[y/N]：')" continue_openvz
         [[ ! "$continue_openvz" =~ ^[Yy]$ ]] && exit 1
     fi
 }
@@ -114,7 +159,7 @@ check_boot_space() {
     if [[ -n "$boot_available" ]]; then
         if [[ $boot_available -lt 100 ]]; then
             warn "/boot 空间不足（可用: ${boot_available}MB），建议清理旧内核后再继续"
-            read -rp "  是否继续? [y/N]: " continue_boot
+            read -rp "$(ui_prompt '仍要继续吗？[y/N]：')" continue_boot
             [[ ! "$continue_boot" =~ ^[Yy]$ ]] && exit 1
         else
             ok "/boot 空间充足（可用: ${boot_available}MB）"
@@ -199,15 +244,13 @@ EOF
     sysctl_apply_file /etc/sysctl.d/99-bbr.conf || warn "部分配置未生效，请查看上面的错误"
 
     # 兜底：强制写入最关键的两条
-    sysctl -w net.core.default_qdisc=fq 2>/dev/null || true
-    sysctl -w net.ipv4.tcp_congestion_control=bbr 2>/dev/null || true
+    sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 || true
+    sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1 || true
 
     if check_bbr_status; then
-        echo ""
-        echo -e "${GREEN}  ┌─────────────────────────────────────────────────┐${PLAIN}"
-        echo -e "${GREEN}  │  ✅  BBR 已启用，实际性能请通过测速验证               │${PLAIN}"
-        echo -e "${GREEN}  └─────────────────────────────────────────────────┘${PLAIN}"
-        echo ""
+        printf '\n'
+        ok 'BBR 已启用'
+        ui_detail '配置已保存，实际网络表现请从客户端验证。'
     else
         echo ""
         error "BBR 启用失败，当前环境可能不支持修改拥塞控制算法"
@@ -275,34 +318,46 @@ effective_memory() {
 }
 
 detect_network() {
-    local dev="" speed="" sample
+    local dev="" speed="" sample queues rxdrop txdrop
     read -r DETECT_TOTAL_MIB DETECT_FREE_MIB < <(effective_memory)
-    info "有效内存: ${DETECT_TOTAL_MIB} MiB；可用估计: ${DETECT_FREE_MIB} MiB"
-    info "CPU: $(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 未知)；内核: $(uname -r)"
+    ui_kv '有效内存' "${DETECT_TOTAL_MIB} MiB（当前可用约 ${DETECT_FREE_MIB} MiB）"
+    ui_kv 'CPU 核心' "$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 未知)"
+    ui_kv '当前内核' "$(uname -r)"
     dev=$(ip -o route show default 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="dev") {print $(i+1); exit}}')
     [[ -n "$dev" ]] || dev=$(ip -o -6 route show default 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="dev") {print $(i+1); exit}}')
     if [[ -n "$dev" ]]; then
-        info "默认出口: $dev（多出口/策略路由时不一定对应所有客户端）"
+        ui_kv '默认出口' "$dev"
         if [[ -r "/sys/class/net/$dev/speed" ]]; then
             speed=$(cat "/sys/class/net/$dev/speed" 2>/dev/null) || speed=""
-            [[ "$speed" =~ ^[0-9]+$ ]] && info "网卡报告速率: $speed Mbps，仅供参考，不当作实际带宽"
+            if [[ "$speed" =~ ^[0-9]+$ ]]; then
+                ui_kv '网卡速率' "$speed Mbps（报告值，不代表实际带宽）"
+            fi
         fi
-        ip -s link show dev "$dev" 2>/dev/null || true
-        info "实际网卡队列（只查看，不替换已有 mq/整形配置）："
-        tc qdisc show dev "$dev" 2>/dev/null || true
+        queues=$(tc qdisc show dev "$dev" 2>/dev/null | awk '$1=="qdisc" && !seen[$2]++ {printf "%s%s",sep,$2; sep=" / "} END {print ""}')
+        ui_kv '网卡队列' "${queues:-不可读取}（保持现状）"
+        if [[ -r "/sys/class/net/$dev/statistics/rx_dropped" && -r "/sys/class/net/$dev/statistics/tx_dropped" ]]; then
+            read -r rxdrop < "/sys/class/net/$dev/statistics/rx_dropped"
+            read -r txdrop < "/sys/class/net/$dev/statistics/tx_dropped"
+            ui_kv '累计丢弃' "网卡接收 ${rxdrop:-未知} / 发送 ${txdrop:-未知}（非线路丢包率）"
+        fi
     else
-        warn "未检测到默认出口；不会据此猜测线路质量"
+        skip '未检测到默认出口，略过网卡信息'
     fi
-    info "读取本机已建立 TCP 连接的一次 RTT 快照（排除回环，仅供诊断）..."
+    printf '\n'
+    info '读取现有 TCP 连接摘要'
     if sample=$(ss -Htin state established 2>/dev/null); then
         read -r DETECT_SAMPLES DETECT_MEDIAN_MS DETECT_P75_MS < <(printf '%s\n' "$sample" | parse_socket_rtts | rtt_summary)
     else
         DETECT_SAMPLES=0 DETECT_MEDIAN_MS=0 DETECT_P75_MS=0
         warn "ss 读取失败，按无样本处理"
     fi
-    info "RTT 样本 ${DETECT_SAMPLES} 个；中位数 ${DETECT_MEDIAN_MS} ms；P75 ${DETECT_P75_MS} ms"
-    echo "这是全机 TCP 平滑 RTT，包含其他服务和出站连接；不用于推断运营商、带宽或参数上限。"
-    echo "仅显示汇总，不保存连接地址；没有样本时继续跳过依赖线路信息的调整。"
+    if (( DETECT_SAMPLES > 0 )); then
+        ui_kv '连接样本' "${DETECT_SAMPLES} 个（排除回环）"
+        ui_kv 'RTT 摘要' "中位数 ${DETECT_MEDIAN_MS} ms / P75 ${DETECT_P75_MS} ms"
+        ui_detail '全机连接快照，仅作诊断，不用于估算线路带宽。'
+    else
+        skip '暂无可用 RTT 样本，继续执行可判断的项目'
+    fi
 }
 
 # 只生成能够可靠判断的修改；不依据 RTT 或虚拟网卡速率猜测缓冲区上限。
@@ -317,7 +372,7 @@ build_auto_tcp_plan() {
 apply_auto_tcp_plan() {
     local plan="$1" conf_file="$2" backup_root="$3"
     [[ "$plan" == 'net.ipv4.tcp_moderate_rcvbuf = 1' ]] || { error "没有可安全应用的自动调优项"; return 1; }
-    local before state_dir staged
+    local before state_dir staged apply_error
     before=$(sysctl -n net.ipv4.tcp_moderate_rcvbuf 2>/dev/null) || { warn "参数已不可读，跳过"; return 0; }
     [[ "$before" == 0 ]] || { info "参数已变化或已经开启，跳过"; return 0; }
     mkdir -p -- "$backup_root" "$(dirname "$conf_file")" || return 1
@@ -335,9 +390,10 @@ apply_auto_tcp_plan() {
     fi
     chmod 644 "$staged" || { rm -f -- "$staged"; return 1; }
     # 先应用并回读验证。宿主机拒绝或不生效时不留下持久配置。
-    if ! sysctl -w net.ipv4.tcp_moderate_rcvbuf=1; then
+    if ! apply_error=$(sysctl -w net.ipv4.tcp_moderate_rcvbuf=1 2>&1); then
         rm -f -- "$staged"
         warn "系统拒绝修改，已跳过，原持久配置保留"
+        [[ -z "$apply_error" ]] || ui_detail "$apply_error"
         return 1
     fi
     if [[ $(sysctl -n net.ipv4.tcp_moderate_rcvbuf 2>/dev/null) != 1 ]]; then
@@ -351,27 +407,35 @@ apply_auto_tcp_plan() {
         rm -f -- "$staged"
         return 1
     fi
-    ok "已开启内核接收缓冲区自动调节；具体大小由内核按连接及现有上限决定"
-    info "配置：$conf_file；备份：$state_dir"
-    echo "恢复运行值：sysctl -p $state_dir/runtime-before.conf"
-    echo "恢复持久配置：还原备份 previous.conf；若有 no-previous-config 标记，则原先没有该文件。"
+    ok '已开启内核接收缓冲区自动调节'
+    ui_detail '具体大小由内核按连接与现有上限决定。'
+    info "配置已保存，备份已完成"
+    ui_detail "配置：$conf_file"
+    ui_detail "备份：$state_dir"
+    printf '\n'
+    ui_detail '需要恢复时，可执行以下命令：'
+    ui_detail "sysctl -p $state_dir/runtime-before.conf"
+    ui_detail '持久配置恢复方法见 README，备份文件已保留。'
 }
 
 tcp_tune() {
-    hr
-    info "自动检测 TCP 环境，无需填写任何参数"
+    ui_step 1 3 '自动检测服务器环境'
     detect_network
     local plan
+    ui_step 2 3 '判断可自动适配的项目'
     plan=$(build_auto_tcp_plan) || return 1
-    info "带宽、三网线路、业务端口和 CDN/直连无法可靠自动判断，不据此修改缓冲区、队列或重试参数"
+    skip '线路带宽与连接拓扑：无法可靠判断，保持现状'
     if [[ -f /etc/sysctl.d/99-tcp-tune.conf ]]; then
         warn "发现旧版调优配置；本次保留，旧参数不会自动恢复。恢复方法见 README。"
     fi
     if [[ -z "$plan" ]]; then
-        ok "未发现可可靠自动调整的项目；已开启、不支持或不可读取的参数均跳过，未写入配置"
+        ui_step 3 3 '执行结果'
+        skip '无需调整：参数已开启，或系统不支持可靠检测'
+        ui_detail '本次未写入配置。'
         return 0
     fi
-    info "检测到接收缓冲区自动调节已关闭，正在自动开启并备份"
+    ui_step 3 3 '备份并应用自动适配'
+    info '检测到接收缓冲区自动调节已关闭，正在开启'
     apply_auto_tcp_plan "$plan" /etc/sysctl.d/99-tcp-auto.conf /var/backups
 }
 
@@ -388,7 +452,7 @@ upgrade_kernel_debian() {
     esac
     info "将从当前软件源安装/更新 $package。已有云厂商定制内核时请先确认兼容性。"
     local confirm
-    read -rp "确认继续? [y/N]: " confirm
+    read -rp "$(ui_prompt '确认更新内核？[y/N]：')" confirm
     [[ "$confirm" =~ ^[Yy]$ ]] || return 0
     check_boot_space
     apt-get update && apt-get install -y "$package" || { error "内核更新失败"; return 1; }
@@ -411,80 +475,90 @@ remove_old_kernels() {
     (( ${#remove[@]} )) || { ok "无须清理：保留当前运行内核和最新两个内核包"; return 0; }
     info "保留当前运行内核和最新两个内核包，将清理："
     printf '  %s\n' "${remove[@]}"
-    read -rp "确认删除? [y/N]: " confirm
+    read -rp "$(ui_prompt '确认删除列出的旧内核？[y/N]：')" confirm
     [[ "$confirm" =~ ^[Yy]$ ]] || return 0
     apt-get purge -y "${remove[@]}" || { error "部分内核清理失败"; return 1; }
     ok "清理完成（未运行 autoremove）"
 }
 
-# ────────────────────────── 系统状态展示 ──────────────────────────
 show_status() {
-    hr
-    local bbr_status bbr_mod qdisc cc
-    check_bbr_status  && bbr_status="${GREEN}✅ 已启用${PLAIN}" || bbr_status="${RED}❌ 未启用${PLAIN}"
-    if grep -q '^tcp_bbr ' /proc/modules 2>/dev/null; then
-        bbr_mod="${GREEN}✅ 已加载（模块）${PLAIN}"
-    elif grep -q 'CONFIG_TCP_CONG_BBR=y' /boot/config-$(uname -r) 2>/dev/null \
-      || zcat /proc/config.gz 2>/dev/null | grep -q 'CONFIG_TCP_CONG_BBR=y'; then
-        bbr_mod="${GREEN}✅ 已内置（built-in）${PLAIN}"
-    elif check_bbr_status; then
-        bbr_mod="${GREEN}✅ 运行中（内置）${PLAIN}"
+    local cc qdisc auto bbr_status auto_status
+    cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) || cc='不可读取'
+    qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null) || qdisc='不可读取'
+    auto=$(sysctl -n net.ipv4.tcp_moderate_rcvbuf 2>/dev/null) || auto='未知'
+    if [[ "$cc" == bbr ]]; then
+        bbr_status="${GREEN}已启用${PLAIN}"
+    elif [[ "$cc" == '不可读取' ]]; then
+        bbr_status="${YELLOW}未知（无法读取）${PLAIN}"
     else
-        bbr_mod="${RED}❌ 未加载${PLAIN}"
+        bbr_status="${YELLOW}未启用${PLAIN}"
     fi
-    qdisc=$(sysctl -n net.core.default_qdisc        2>/dev/null || echo "未设置")
-    cc=$(sysctl -n net.ipv4.tcp_congestion_control  2>/dev/null || echo "未设置")
-
-    printf "  ${CYAN}%-18s${PLAIN} %s\n"    "操作系统:"   "$OS $VER"
-    printf "  ${CYAN}%-18s${PLAIN} %s\n"    "系统架构:"   "$ARCH"
-    printf "  ${CYAN}%-18s${PLAIN} %s\n"    "内核版本:"   "$(uname -r)"
-    printf "  ${CYAN}%-18s${PLAIN}${bbr_status}\n" "BBR 状态:"
-    printf "  ${CYAN}%-18s${PLAIN}${bbr_mod}\n"    "BBR 模块:"
-    printf "  ${CYAN}%-18s${PLAIN} %s\n"    "队列算法:"   "$qdisc"
-    printf "  ${CYAN}%-18s${PLAIN} %s\n"    "拥塞控制:"   "$cc"
-
-    # 配置文件存在不代表运行值已生效。
-    if [[ -f /etc/sysctl.d/99-tcp-auto.conf || -f /etc/sysctl.d/99-tcp-tune.conf ]]; then
-        printf "  ${CYAN}%-18s${PLAIN} ${GREEN}配置文件存在（生效情况请检查）${PLAIN}\n" "TCP 调优:"
-    else
-        printf "  ${CYAN}%-18s${PLAIN} ${YELLOW}⬜ 未应用${PLAIN}\n" "TCP 调优:"
+    case "$auto" in
+        1) auto_status="${GREEN}已开启${PLAIN}" ;;
+        0) auto_status="${YELLOW}未开启，可选 2 自动检测${PLAIN}" ;;
+        *) auto_status="${YELLOW}不可判断，将自动跳过${PLAIN}" ;;
+    esac
+    ui_kv '操作系统' "${OS:-debian} ${VER:-未知} / ${ARCH:-未知}"
+    ui_kv '当前内核' "$(uname -r)"
+    ui_kv 'BBR 状态' "$bbr_status"
+    ui_kv '拥塞控制' "$cc"
+    ui_kv '默认队列' "$qdisc"
+    ui_kv 'TCP 自动' "$auto_status"
+    if [[ -f /etc/sysctl.d/99-tcp-auto.conf ]]; then
+        ui_kv '持久配置' '已保存自动适配配置（运行状态见上方）'
     fi
-    hr
+    if [[ -f /etc/sysctl.d/99-tcp-tune.conf ]]; then
+        ui_kv '旧版配置' "${YELLOW}存在，历史设置仍保留${PLAIN}"
+    fi
 }
 
 show_menu() {
     local choice
     while true; do
-        banner
+        ui_section '系统概览'
         show_status
-        echo "1. 启用 BBR"
-        echo "2. TCP 自动检测与适配（无需设置）"
-        echo "3. 更新 Debian 内核"
-        echo "4. 清理旧内核（保留当前及最新两个）"
-        echo "5. 查看状态"
-        echo "0. 退出"
-        read -rp "请选择 [0-5]: " choice || return 0
+        ui_section '请选择操作'
+        printf '  %s1%s  开启 BBR\n' "$GREEN" "$PLAIN"
+        ui_detail '启用拥塞控制，并保存配置'
+        printf '\n  %s2%s  TCP 自动检测与适配  %s[无需设置]%s\n' "$GREEN" "$PLAIN" "$CYAN" "$PLAIN"
+        ui_detail '自动检测 · 能适配才调整 · 其余跳过'
+        printf '\n'
+        hr
+        printf '  %s3%s  更新 Debian 内核\n' "$CYAN" "$PLAIN"
+        printf '  %s4%s  清理旧内核\n' "$CYAN" "$PLAIN"
+        printf '  %s5%s  查看当前状态\n' "$CYAN" "$PLAIN"
+        printf '  %s0%s  退出\n' "$DIM" "$PLAIN"
+        read -rp "$(ui_prompt '输入编号 [0–5]：')" choice || return 0
         case "$choice" in
-            1) enable_bbr ;;
-            2) tcp_tune ;;
-            3) upgrade_kernel_debian ;;
-            4) remove_old_kernels ;;
-            5) show_status ;;
-            0) return 0 ;;
-            *) warn "无效选项" ;;
+            1) run_action '开启 BBR' enable_bbr ;;
+            2) run_action 'TCP 自动检测与适配' tcp_tune ;;
+            3) run_action '更新 Debian 内核' upgrade_kernel_debian ;;
+            4) run_action '清理旧内核' remove_old_kernels ;;
+            5) ui_section '当前系统状态'; show_status ;;
+            0) printf '\n'; info '已退出。配置结果已保留。'; printf '\n'; return 0 ;;
+            *) warn '请输入 0 到 5 之间的编号。'; continue ;;
         esac
         [[ "$choice" == 2 ]] && continue
-        read -rp "按 Enter 继续..." _ || return 0
+        read -rp "$(ui_prompt '按 Enter 返回菜单…')" _ || return 0
     done
 }
 
 main() {
-    # 必须先完成版本检查，再允许安装依赖或修改系统。
+    banner
+    ui_step 1 4 '检查系统版本'
     check_system
-    [[ $EUID -eq 0 ]] || die "请使用 root 用户运行（sudo bash bbr.sh）"
-    [[ -t 0 ]] || die "请先下载脚本，再在交互终端运行；不要使用 curl | bash"
-    check_dependencies || die "依赖安装失败"
+    ok "Debian $VER / $ARCH"
+    ui_step 2 4 '检查运行环境'
+    [[ $EUID -eq 0 ]] || die '请使用 root 用户运行（sudo bash bbr.sh）'
+    [[ -t 0 ]] || die '请先下载脚本，再在交互终端运行；不要使用 curl | bash'
+    ok 'root 权限与交互终端已就绪'
+    ui_step 3 4 '检查系统依赖'
+    check_dependencies || die '依赖安装失败，请查看上方软件包管理器输出'
+    ok '所需命令已就绪'
+    ui_step 4 4 '检测虚拟化环境'
     check_virt
+    printf '\n'
+    ok '准备完成，进入操作菜单'
     show_menu
 }
 
