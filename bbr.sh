@@ -5,7 +5,7 @@ export PATH
 #=================================================
 #   System  : Debian 12 / 13 and later
 #   Desc    : BBR一键加速 + TCP深度调优
-#   Version : 3.1.0-debian
+#   Version : 3.2.0-debian
 #   Author  : VPS值得买
 #   测评网站    : https://vpszdm.com
 #=================================================
@@ -19,7 +19,7 @@ CYAN='\033[0;96m'
 BOLD='\033[1m'
 PLAIN='\033[0m'
 
-sh_ver="3.1.0-debian"
+sh_ver="3.2.0-debian"
 
 # ────────────────────────── 通用工具函数 ──────────────────────────
 info()    { echo -e "${BLUE}[INFO]${PLAIN}  $*"; }
@@ -247,11 +247,6 @@ rtt_summary() {
     }'
 }
 
-valid_measurement() {
-    [[ "$1" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 1
-    awk -v n="$1" -v max="$2" 'BEGIN {exit !(n>0 && n<=max)}'
-}
-
 effective_memory() {
     local total available limit used f
     read -r total available < <(awk '
@@ -279,27 +274,8 @@ effective_memory() {
     printf '%s %s\n' "$total" "$available"
 }
 
-recommend_buffer_mib() {
-    # 工程启发式，不是 BBR 算法参数：内存约束 + 约 2 倍带宽时延积。
-    # 参数均由内部检测或通过校验的数值提供；用 awk 避免输入进入 shell 算术表达式。
-    awk -v total="$1" -v free="$2" -v bw="$3" -v rtt="$4" 'BEGIN {
-        cap=8
-        if(total>=512 && free>=128) cap=16
-        if(total>=1024 && free>=256) cap=32
-        if(total>=2048 && free>=512) cap=64
-        if(total>=4096 && free>=1024) cap=128
-        result=(cap<32 ? cap : 32)
-        if(bw>0 && rtt>0) {
-            need=2*bw*rtt*125/1048576
-            while(result<need && result<cap) result*=2
-        }
-        if(result>cap) result=cap
-        print result
-    }'
-}
-
 detect_network() {
-    local port="$1" dev="" speed="" sample
+    local dev="" speed="" sample
     read -r DETECT_TOTAL_MIB DETECT_FREE_MIB < <(effective_memory)
     info "有效内存: ${DETECT_TOTAL_MIB} MiB；可用估计: ${DETECT_FREE_MIB} MiB"
     info "CPU: $(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 未知)；内核: $(uname -r)"
@@ -317,114 +293,86 @@ detect_network() {
     else
         warn "未检测到默认出口；不会据此猜测线路质量"
     fi
-    info "读取本机 TCP $port 入站已建立连接的一次 RTT 快照（排除回环）..."
-    if sample=$(ss -Htin state established "( sport = :$port )" 2>/dev/null); then
+    info "读取本机已建立 TCP 连接的一次 RTT 快照（排除回环，仅供诊断）..."
+    if sample=$(ss -Htin state established 2>/dev/null); then
         read -r DETECT_SAMPLES DETECT_MEDIAN_MS DETECT_P75_MS < <(printf '%s\n' "$sample" | parse_socket_rtts | rtt_summary)
     else
         DETECT_SAMPLES=0 DETECT_MEDIAN_MS=0 DETECT_P75_MS=0
         warn "ss 读取失败，按无样本处理"
     fi
     info "RTT 样本 ${DETECT_SAMPLES} 个；中位数 ${DETECT_MEDIAN_MS} ms；P75 ${DETECT_P75_MS} ms"
-    echo "这是 TCP 平滑 RTT，不是三网测速或丢包率；同端口也可能包含网站访问。"
-    echo "不采集客户端 IP 到报告，不读取 Xray/Nginx 配置。建议让国内客户端连接并传输后重试。"
+    echo "这是全机 TCP 平滑 RTT，包含其他服务和出站连接；不用于推断运营商、带宽或参数上限。"
+    echo "仅显示汇总，不保存连接地址；没有样本时继续跳过依赖线路信息的调整。"
 }
 
-write_adaptive_config() {
-    local bytes="$1"
-    [[ "$bytes" =~ ^[0-9]+$ ]] || return 1
-    cat <<EOF
-# Debian BBR 自适应 TCP 配置；上限由内存与可选 BDP 估算决定。
-# 不修改 BBR 内部增益，不承诺三网最优；不替换实际网卡队列。
-net.core.rmem_max = $bytes
-net.core.wmem_max = $bytes
-net.ipv4.tcp_rmem = 4096 131072 $bytes
-net.ipv4.tcp_wmem = 4096 65536 $bytes
-net.ipv4.tcp_moderate_rcvbuf = 1
-net.ipv4.tcp_no_metrics_save = 0
-net.ipv4.tcp_mtu_probing = 1
-net.ipv4.tcp_sack = 1
-net.ipv4.tcp_timestamps = 1
-net.ipv4.tcp_window_scaling = 1
-net.ipv4.tcp_syncookies = 1
-net.ipv4.tcp_slow_start_after_idle = 0
-EOF
+# 只生成能够可靠判断的修改；不依据 RTT 或虚拟网卡速率猜测缓冲区上限。
+build_auto_tcp_plan() {
+    local current
+    if current=$(sysctl -n net.ipv4.tcp_moderate_rcvbuf 2>/dev/null); then
+        [[ "$current" == 0 ]] && printf '%s\n' 'net.ipv4.tcp_moderate_rcvbuf = 1'
+    fi
+    return 0
+}
+
+apply_auto_tcp_plan() {
+    local plan="$1" conf_file="$2" backup_root="$3"
+    [[ "$plan" == 'net.ipv4.tcp_moderate_rcvbuf = 1' ]] || { error "没有可安全应用的自动调优项"; return 1; }
+    local before state_dir staged
+    before=$(sysctl -n net.ipv4.tcp_moderate_rcvbuf 2>/dev/null) || { warn "参数已不可读，跳过"; return 0; }
+    [[ "$before" == 0 ]] || { info "参数已变化或已经开启，跳过"; return 0; }
+    mkdir -p -- "$backup_root" "$(dirname "$conf_file")" || return 1
+    state_dir=$(mktemp -d "$backup_root/debian-bbr-auto.XXXXXXXX") || return 1
+    if [[ -e "$conf_file" ]]; then
+        cp -a -- "$conf_file" "$state_dir/previous.conf" || return 1
+    else
+        touch "$state_dir/no-previous-config" || return 1
+    fi
+    printf '%s\n' "net.ipv4.tcp_moderate_rcvbuf = $before" > "$state_dir/runtime-before.conf" || return 1
+    staged=$(mktemp "$(dirname "$conf_file")/.debian-bbr-auto.XXXXXXXX") || return 1
+    if ! printf '# Managed by Debian BBR automatic tuning\n%s\n' "$plan" > "$staged"; then
+        rm -f -- "$staged"
+        return 1
+    fi
+    chmod 644 "$staged" || { rm -f -- "$staged"; return 1; }
+    # 先应用并回读验证。宿主机拒绝或不生效时不留下持久配置。
+    if ! sysctl -w net.ipv4.tcp_moderate_rcvbuf=1; then
+        rm -f -- "$staged"
+        warn "系统拒绝修改，已跳过，原持久配置保留"
+        return 1
+    fi
+    if [[ $(sysctl -n net.ipv4.tcp_moderate_rcvbuf 2>/dev/null) != 1 ]]; then
+        sysctl -w "net.ipv4.tcp_moderate_rcvbuf=$before" >/dev/null 2>&1 || warn "运行值恢复失败，请检查系统限制"
+        rm -f -- "$staged"
+        warn "无法验证参数生效，未保存持久配置"
+        return 1
+    fi
+    if ! mv -f -- "$staged" "$conf_file"; then
+        sysctl -w "net.ipv4.tcp_moderate_rcvbuf=$before" >/dev/null 2>&1 || warn "运行值恢复失败，请检查系统限制"
+        rm -f -- "$staged"
+        return 1
+    fi
+    ok "已开启内核接收缓冲区自动调节；具体大小由内核按连接及现有上限决定"
+    info "配置：$conf_file；备份：$state_dir"
+    echo "恢复运行值：sysctl -p $state_dir/runtime-before.conf"
+    echo "恢复持久配置：还原备份 previous.conf；若有 no-previous-config 标记，则原先没有该文件。"
 }
 
 tcp_tune() {
     hr
-    echo "直连 VLESS + WS/XHTTP + TLS：先诊断，再预览，确认后才写入。"
-    echo "XHTTP 使用 H3/QUIC 时，TCP 调优不直接控制该 UDP 传输；CDN 场景 RTT 也不代表国内客户端。"
-    local port topology bw rtt manual cap bytes confirm preview state_dir key value
-    read -rp "公网 TLS/TCP 入站端口 [443]: " port || return 0
-    port=${port:-443}
-    [[ "$port" =~ ^[0-9]{1,5}$ ]] && (( 10#$port >= 1 && 10#$port <= 65535 )) || { error "端口无效"; return 1; }
-    port=$((10#$port))
-    read -rp "连接方式 [1=直连，2=CDN/不确定；默认1]: " topology || return 0
-    topology=${topology:-1}
-    [[ "$topology" == 1 || "$topology" == 2 ]] || { error "选项无效"; return 1; }
-    detect_network "$port"
-    echo "套餐带宽只作为估算输入；不要填虚拟网卡速率或把共享峰值当保底。"
-    read -rp "预计分配给单条代理连接的带宽 Mbps [留空=未知]: " bw || return 0
-    if [[ -n "$bw" ]]; then
-        valid_measurement "$bw" 100000 || { error "带宽应为 0 到 100000 之间的正数"; return 1; }
-    else
-        bw=0
+    info "自动检测 TCP 环境，无需填写任何参数"
+    detect_network
+    local plan
+    plan=$(build_auto_tcp_plan) || return 1
+    info "带宽、三网线路、业务端口和 CDN/直连无法可靠自动判断，不据此修改缓冲区、队列或重试参数"
+    if [[ -f /etc/sysctl.d/99-tcp-tune.conf ]]; then
+        warn "发现旧版调优配置；本次保留，旧参数不会自动恢复。恢复方法见 README。"
     fi
-    rtt=0
-    if [[ "$topology" == 1 ]] && (( DETECT_SAMPLES >= 5 )); then
-        rtt=$DETECT_P75_MS
-        info "直连样本达到 5 个，使用当前快照的 P75 RTT 估算（非运营商分类）"
-    else
-        warn "无足够直连样本，或连接经过 CDN，不自动用该 RTT 放大缓冲区"
+    if [[ -z "$plan" ]]; then
+        ok "未发现可可靠自动调整的项目；已开启、不支持或不可读取的参数均跳过，未写入配置"
+        return 0
     fi
-    read -rp "可填写从国内客户端测得的 TCP RTT 毫秒 [留空=沿用可用样本/未知]: " manual || return 0
-    if [[ -n "$manual" ]]; then
-        valid_measurement "$manual" 10000 || { error "RTT 应为 0 到 10000 之间的正数"; return 1; }
-        if [[ "$topology" == 1 ]]; then
-            rtt=$manual
-        else
-            warn "CDN 场景客户端 RTT 不等于回源 RTT；本次不用于计算源站 TCP 缓冲区"
-        fi
-    fi
-    cap=$(recommend_buffer_mib "$DETECT_TOTAL_MIB" "$DETECT_FREE_MIB" "$bw" "$rtt")
-    bytes=$((cap * 1048576))
-    info "建议每个方向缓冲区上限: $cap MiB；BW=$bw Mbps，估算 RTT=$rtt ms（0=未知/不使用）"
-    echo "这是试验上限，不会预分配给每条连接；高并发仍可能增加内存压力。"
-    echo "算法依据：约 2 倍带宽时延积，按内存余量封顶 8/16/32/64/128 MiB；未知线路不主动升档。"
-    echo "以下是将写入的完整配置："
-    preview=$(write_adaptive_config "$bytes") || return 1
-    printf '%s\n' "$preview"
-    echo "不修改 Xray/Nginx、路由、端口范围、conntrack、文件上限或 SYN 重试。"
-    echo "旧版已修改的其他运行值不会因移除旧配置而立即复原；需要按原备份恢复或重启后核对。"
-    read -rp "备份并应用上述配置? [y/N]: " confirm || return 0
-    [[ "$confirm" =~ ^[Yy]$ ]] || { info "已取消，未写入调优配置"; return 0; }
-
-    state_dir=$(mktemp -d /var/backups/debian-bbr-tune.XXXXXXXX) || return 1
-    if [[ -e /etc/sysctl.d/99-tcp-tune.conf ]]; then
-        cp -a /etc/sysctl.d/99-tcp-tune.conf "$state_dir/" || return 1
-    else
-        touch "$state_dir/no-previous-tcp-config" || return 1
-    fi
-    while IFS='=' read -r key _; do
-        [[ "$key" == \#* || -z "$key" ]] && continue
-        key=${key// /}
-        if value=$(sysctl -n "$key" 2>/dev/null); then
-            printf '%s = %s\n' "$key" "$value" >> "$state_dir/runtime-before.conf" || return 1
-        fi
-    done <<< "$preview"
-    printf 'port=%s\ntopology=%s\nsamples=%s\nrtt_median_ms=%s\nrtt_p75_ms=%s\nchosen_rtt_ms=%s\nbandwidth_mbps=%s\nbuffer_mib=%s\n' \
-        "$port" "$topology" "$DETECT_SAMPLES" "$DETECT_MEDIAN_MS" "$DETECT_P75_MS" "$rtt" "$bw" "$cap" > "$state_dir/report.txt" || return 1
-    mkdir -p /etc/sysctl.d || return 1
-    printf '%s\n' "$preview" > /etc/sysctl.d/99-tcp-tune.conf || return 1
-    info "配置与运行值备份：$state_dir"
-    if sysctl_apply_file /etc/sysctl.d/99-tcp-tune.conf; then
-        ok "全部目标参数已应用。请从国内客户端比较单连接吞吐、加载延迟和重传。"
-    else
-        warn "部分参数失败；配置已保存，请检查上方错误，不能视为全部生效。"
-        return 1
-    fi
-    echo "恢复本次涉及的运行值：sysctl -p $state_dir/runtime-before.conf"
-    echo "恢复持久配置：有旧文件时将备份复制回原路径；标记 no-previous-tcp-config 表示原先没有此文件。"
+    info "检测到接收缓冲区自动调节已关闭，正在自动开启并备份"
+    apply_auto_tcp_plan "$plan" /etc/sysctl.d/99-tcp-auto.conf /var/backups
 }
 
 # 仅使用当前 Debian 已配置的软件源，不更换源，不安装第三方内核。
@@ -495,8 +443,8 @@ show_status() {
     printf "  ${CYAN}%-18s${PLAIN} %s\n"    "队列算法:"   "$qdisc"
     printf "  ${CYAN}%-18s${PLAIN} %s\n"    "拥塞控制:"   "$cc"
 
-    # TCP 调优状态
-    if [[ -f /etc/sysctl.d/99-tcp-tune.conf ]]; then
+    # 配置文件存在不代表运行值已生效。
+    if [[ -f /etc/sysctl.d/99-tcp-auto.conf || -f /etc/sysctl.d/99-tcp-tune.conf ]]; then
         printf "  ${CYAN}%-18s${PLAIN} ${GREEN}配置文件存在（生效情况请检查）${PLAIN}\n" "TCP 调优:"
     else
         printf "  ${CYAN}%-18s${PLAIN} ${YELLOW}⬜ 未应用${PLAIN}\n" "TCP 调优:"
@@ -510,7 +458,7 @@ show_menu() {
         banner
         show_status
         echo "1. 启用 BBR"
-        echo "2. 网络检测 + 自适应 TCP 调优（直连 WS/XHTTP）"
+        echo "2. TCP 自动检测与适配（无需设置）"
         echo "3. 更新 Debian 内核"
         echo "4. 清理旧内核（保留当前及最新两个）"
         echo "5. 查看状态"
@@ -525,6 +473,7 @@ show_menu() {
             0) return 0 ;;
             *) warn "无效选项" ;;
         esac
+        [[ "$choice" == 2 ]] && continue
         read -rp "按 Enter 继续..." _ || return 0
     done
 }
