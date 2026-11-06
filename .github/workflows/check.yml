@@ -13,4 +13,4 @@ jobs:
       - name: Bash syntax and safe smoke tests on Debian
         run: |
           docker run --rm -v "$PWD:/src:ro" -w /src debian:${{ matrix.debian }} \
-            bash -c 'bash -n bbr.sh && bash -n tests/smoke.sh && bash tests/smoke.sh'
+            bash -c 'bash -n bbr.sh && bash -n tests/smoke.sh && bash tests/smoke.sh && TERM=xterm BBR_COLOR=always bash -c "source ./bbr.sh; check_system; banner; show_menu <<< 0"'
