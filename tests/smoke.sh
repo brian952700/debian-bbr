@@ -51,22 +51,6 @@ remove_old_kernels <<< n
 dpkg-query() { echo 'installed linux-image-6.1.0-18-amd64'; }
 remove_old_kernels < /dev/null
 [[ ! -s "$tmp/apt.log" ]] || fail 'removed only kernel'
-[[ $(recommend_buffer_mib 512 128 1000 200) == 16 ]] || fail 'small VPS ceiling'
-[[ $(recommend_buffer_mib 2048 600 1000 200) == 64 ]] || fail 'large BDP upgrade'
-[[ $(recommend_buffer_mib 4096 2048 10000 200) == 128 ]] || fail 'absolute cap'
-[[ $(recommend_buffer_mib 4096 2048 100 100) == 32 ]] || fail 'low BDP stays standard'
-[[ $(recommend_buffer_mib 4096 2048 0 0) == 32 ]] || fail 'unknown network escalated'
-[[ $(recommend_buffer_mib 4096 64 1000 200) == 8 ]] || fail 'memory pressure ignored'
-[[ $(recommend_buffer_mib 0 0 1000 200) == 8 ]] || fail 'missing memory escalated'
-for invalid in '-1' '0' '1e3' '1;id' '9999999999999' ''; do
-    if valid_measurement "$invalid" 100000; then fail 'invalid measurement accepted'; fi
-done
-valid_measurement 0.5 100000 || fail 'decimal rejected'
-write_adaptive_config 67108864 > "$tmp/generated.conf"
-grep -Fx 'net.ipv4.tcp_rmem = 4096 131072 67108864' "$tmp/generated.conf" || fail 'wrong buffer'
-if grep -Eq 'tcp_mem|conntrack|tcp_max_tw_buckets|tcp_syn_retries|nofile' "$tmp/generated.conf"; then
-    fail 'unrelated tuning reintroduced'
-fi
 
 ss() {
     cat <<'EOF'
@@ -91,11 +75,69 @@ EOF
 effective_memory() { echo '2048 600'; }
 ip() { return 0; }
 tc() { return 0; }
-detect_network 443
+detect_network
 [[ "$DETECT_SAMPLES $DETECT_MEDIAN_MS $DETECT_P75_MS" == '5 200.000 250.000' ]] || fail 'diagnostic result'
 ss() { return 1; }
-detect_network 443
+detect_network
 [[ "$DETECT_SAMPLES" == 0 ]] || fail 'ss failure not handled'
-tcp_tune <<< $'443\n1\n\n\nn' > "$tmp/cancel.out"
-grep -q '已取消，未写入调优配置' "$tmp/cancel.out" || fail 'cancel flow failed'
-echo 'PASS: OS, sysctl, kernel safety, adaptive bounds, RTT parsing, detection failure and cancellation'
+sysctl() {
+    if [[ "$1" == -n ]]; then
+        [[ ${AUTO_MODE:-ok} != unreadable ]] || return 1
+        cat "$tmp/auto-state"
+    elif [[ "$1" == -w ]]; then
+        printf '%s\n' "$2" >> "$tmp/auto-writes"
+        [[ ${AUTO_MODE:-ok} != deny ]] || return 1
+        [[ ${AUTO_MODE:-ok} != no_effect ]] || return 0
+        printf '%s\n' "${2##*=}" > "$tmp/auto-state"
+    else
+        return 1
+    fi
+}
+echo 0 > "$tmp/auto-state"
+plan=$(build_auto_tcp_plan)
+[[ "$plan" == 'net.ipv4.tcp_moderate_rcvbuf = 1' ]] || fail 'disabled auto tuning not detected'
+echo 1 > "$tmp/auto-state"
+[[ -z $(build_auto_tcp_plan) ]] || fail 'already enabled not skipped'
+echo unexpected > "$tmp/auto-state"
+[[ -z $(build_auto_tcp_plan) ]] || fail 'unknown value not skipped'
+AUTO_MODE=unreadable
+[[ -z $(build_auto_tcp_plan) ]] || fail 'unreadable value not skipped'
+AUTO_MODE=ok
+echo 0 > "$tmp/auto-state"
+mkdir -p "$tmp/conf"
+apply_auto_tcp_plan "$plan" "$tmp/conf/auto.conf" "$tmp/backups" < /dev/null
+[[ $(cat "$tmp/auto-state") == 1 ]] || fail 'auto tuning not enabled'
+grep -Fx "$plan" "$tmp/conf/auto.conf" || fail 'not persisted'
+grep -Fx 'net.ipv4.tcp_moderate_rcvbuf = 0' "$tmp"/backups/*/runtime-before.conf || fail 'missing runtime backup'
+markers=("$tmp"/backups/*/no-previous-config)
+[[ -f "${markers[0]}" ]] || fail 'missing absence marker'
+
+echo 'previous config' > "$tmp/conf/auto.conf"
+echo 0 > "$tmp/auto-state"
+AUTO_MODE=deny
+if apply_auto_tcp_plan "$plan" "$tmp/conf/auto.conf" "$tmp/denied" < /dev/null; then fail 'denied write reported success'; fi
+[[ $(cat "$tmp/conf/auto.conf") == 'previous config' ]] || fail 'denied write changed persistence'
+AUTO_MODE=no_effect
+if apply_auto_tcp_plan "$plan" "$tmp/conf/auto.conf" "$tmp/no-effect" < /dev/null; then fail 'unverified write persisted'; fi
+[[ $(cat "$tmp/conf/auto.conf") == 'previous config' ]] || fail 'no-effect write changed persistence'
+AUTO_MODE=ok
+mv() { return 1; }
+if apply_auto_tcp_plan "$plan" "$tmp/conf/auto.conf" "$tmp/save-failure" < /dev/null; then fail 'save failure hidden'; fi
+[[ $(cat "$tmp/auto-state") == 0 ]] || fail 'save failure did not restore runtime'
+[[ $(cat "$tmp/conf/auto.conf") == 'previous config' ]] || fail 'save failure changed persistence'
+unset -f mv
+
+# The menu action must not read stdin or require user-supplied measurements.
+detect_network() { echo 'mock diagnostics'; }
+apply_auto_tcp_plan() { printf '%s\n' "$1" >> "$tmp/menu-applies"; }
+echo 0 > "$tmp/auto-state"
+tcp_tune < /dev/null
+[[ $(cat "$tmp/menu-applies") == "$plan" ]] || fail 'noninteractive menu did not apply'
+: > "$tmp/menu-applies"
+echo 1 > "$tmp/auto-state"
+tcp_tune < /dev/null
+[[ ! -s "$tmp/menu-applies" ]] || fail 'enabled value not skipped by menu'
+AUTO_MODE=unreadable
+tcp_tune < /dev/null
+[[ ! -s "$tmp/menu-applies" ]] || fail 'unreadable value not skipped by menu'
+echo 'PASS: OS, kernel safety, RTT diagnostics, zero-input tuning, skip cases and rollback'
