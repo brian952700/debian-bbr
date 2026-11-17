@@ -511,7 +511,7 @@ kernel_current_package() {
     image="/boot/vmlinuz-$release"
     owner=$(dpkg-query -S -- "$image" 2>/dev/null) || return 1
     # Reject multiple owners/diversions and require an exact path match.
-    [[ "$owner" != *$'\n'* && "$owner" == *": $image" ]] || return 1
+    [[ "$owner" != *$'\n'* && "$owner" != *,* && "$owner" == *": $image" ]] || return 1
     owner="${owner%": $image"}"
     owner="${owner%%:*}"
     case "$owner" in
