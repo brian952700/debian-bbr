@@ -18,41 +18,171 @@ check_system
 
 tmp=$(mktemp -d)
 trap 'rm -rf -- "$tmp"' EXIT
-cat > "$tmp/sysctl.conf" <<'EOF'
-# comment
-
-net.ipv4.tcp_rmem = 4096 87380 33554432
-net.ipv4.tcp_congestion_control = bbr
-EOF
-sysctl() { printf '%s\n' "$*" >> "$tmp/sysctl.log"; }
-sysctl_apply_file "$tmp/sysctl.conf"
-grep -Fx -- '-w net.ipv4.tcp_rmem=4096 87380 33554432' "$tmp/sysctl.log" || fail 'lost buffer spaces'
-[[ $(wc -l < "$tmp/sysctl.log") == 2 ]] || fail 'bad sysctl count'
-sysctl() { return 1; }
-if sysctl_apply_file "$tmp/sysctl.conf"; then fail 'hid sysctl failure'; fi
-if sysctl_apply_file "$tmp/missing"; then fail 'accepted missing file'; fi
-
-# Running kernel is older than the two newest; all three must survive cleanup.
-uname() { echo '6.1.0-18-amd64'; }
-dpkg-query() {
-    printf '%s\n' \
-        'installed linux-image-6.1.0-17-amd64' \
-        'installed linux-image-6.1.0-18-amd64' \
-        'installed linux-image-6.1.0-19-amd64' \
-        'installed linux-image-6.12.0-1-amd64' \
-        'config-files linux-image-6.1.0-16-amd64'
+# Keep simulated live sysctl values in files so command substitutions share state.
+bbr_conf="$tmp/bbr-test/99-bbr.conf"
+bbr_cc_key=net.ipv4.tcp_congestion_control
+bbr_qdisc_key=net.core.default_qdisc
+mkdir -p -- "${bbr_conf%/*}"
+reset_bbr_test() {
+    printf '%s\n' 'cubic' > "$tmp/$bbr_cc_key"
+    printf '%s\n' 'fq_codel' > "$tmp/$bbr_qdisc_key"
+    printf '%s\n' '# prior config' 'net.ipv4.tcp_sack = 1' > "$bbr_conf"
+    cp -- "$bbr_conf" "$tmp/bbr-before.conf"
+    : > "$tmp/bbr-writes"
 }
-apt-get() { printf '%s\n' "$*" >> "$tmp/apt.log"; }
-remove_old_kernels <<< y
-[[ $(cat "$tmp/apt.log") == 'purge -y linux-image-6.1.0-17-amd64' ]] || fail 'unsafe kernel cleanup'
-: > "$tmp/apt.log"
-remove_old_kernels <<< n
-[[ ! -s "$tmp/apt.log" ]] || fail 'ignored cancellation'
-dpkg-query() { echo 'installed linux-image-6.1.0-18-amd64'; }
-remove_old_kernels < /dev/null
-[[ ! -s "$tmp/apt.log" ]] || fail 'removed only kernel'
+sysctl() {
+    local key="${2%%=*}" value="${2#*=}"
+    case "$1" in
+        -n) cat -- "$tmp/$key" ;;
+        -w)
+            printf '%s\n' "$2" >> "$tmp/bbr-writes"
+            case "${BBR_TEST_MODE:-ok}:$value" in
+                deny_bbr:bbr|deny_fq:fq) return 1 ;;
+                missing_fq_readback:fq) return 0 ;;
+            esac
+            printf '%s\n' "$value" > "$tmp/$key"
+            ;;
+        *) return 1 ;;
+    esac
+}
 
-ss() {
+reset_bbr_test
+if BBR_TEST_MODE=deny_bbr enable_bbr "$bbr_conf" "$tmp/backup-bbr-denied"; then fail 'rejected BBR reported success'; fi
+cmp -s "$bbr_conf" "$tmp/bbr-before.conf" || fail 'rejected BBR changed persistence'
+[[ $(cat "$tmp/$bbr_qdisc_key") == fq_codel ]] || fail 'rejected BBR changed queue'
+[[ $(cat "$tmp/bbr-writes") == "$bbr_cc_key=bbr" ]] || fail 'rejected BBR led to extra writes'
+
+reset_bbr_test
+BBR_TEST_MODE=deny_fq enable_bbr "$bbr_conf" "$tmp/backup-fq-denied"
+[[ $(cat "$tmp/$bbr_cc_key") == bbr ]] || fail 'fq rejection prevented BBR'
+[[ $(cat "$tmp/$bbr_qdisc_key") == fq_codel ]] || fail 'fq rejection changed queue'
+grep -Fxq "$bbr_cc_key = bbr" "$bbr_conf" || fail 'BBR missing from persistent config'
+if grep -Fq "$bbr_qdisc_key" "$bbr_conf"; then fail 'rejected fq persisted'; fi
+grep -Fxq 'net.ipv4.tcp_sack = 1' "$bbr_conf" || fail 'unrelated config entry removed'
+
+reset_bbr_test
+BBR_TEST_MODE=missing_fq_readback enable_bbr "$bbr_conf" "$tmp/backup-fq-unverified"
+if grep -Fq "$bbr_qdisc_key" "$bbr_conf"; then fail 'unverified fq persisted'; fi
+
+reset_bbr_test
+mv() { return 1; }
+if enable_bbr "$bbr_conf" "$tmp/backup-bbr-save-failed"; then fail 'save failure reported success'; fi
+unset -f mv
+[[ $(cat "$tmp/$bbr_cc_key") == cubic ]] || fail 'BBR was not rolled back'
+[[ $(cat "$tmp/$bbr_qdisc_key") == fq_codel ]] || fail 'queue was not rolled back'
+cmp -s "$bbr_conf" "$tmp/bbr-before.conf" || fail 'save failure changed persistence'
+
+reset_bbr_test
+enable_bbr "$bbr_conf" "$tmp/backup-bbr-ok"
+grep -Fxq "$bbr_qdisc_key = fq" "$bbr_conf" || fail 'verified fq missing from config'
+: > "$tmp/bbr-writes"
+enable_bbr "$bbr_conf" "$tmp/backup-bbr-repeat"
+[[ ! -s "$tmp/bbr-writes" && ! -e "$tmp/backup-bbr-repeat" ]] || fail 'unchanged settings re-applied on repeat'
+echo 'PASS: BBR and fq verification, rollback and idempotence'
+
+# Running kernel identification, flavour retention and APT's simulated plan.
+kernel_case=known
+kernel_fallback=available
+apt_plan=expected
+apt_log="$tmp/kernel-apt.log"
+systemd-detect-virt() { [[ "$kernel_case" == container ]]; }
+uname() { printf '%s\n' '6.1.0-18-amd64'; }
+dpkg-query() {
+    case "$1" in
+        -S)
+            [[ "$kernel_case" != unknown ]] || return 1
+            if [[ "$kernel_case" == multiple_owners ]]; then
+                printf '%s\n' 'linux-image-6.1.0-18-amd64:amd64, another-package: /boot/vmlinuz-6.1.0-18-amd64'
+            elif [[ "$kernel_case" == unsigned ]]; then
+                printf '%s\n' 'linux-image-6.1.0-18-amd64-unsigned: /boot/vmlinuz-6.1.0-18-amd64'
+            else
+                printf '%s\n' 'linux-image-6.1.0-18-amd64:amd64: /boot/vmlinuz-6.1.0-18-amd64'
+            fi
+            ;;
+        -W)
+            if [[ "$*" == *'linux-image-amd64' ]]; then
+                printf '%s' 'installed'
+            elif [[ "$kernel_case" == unsigned ]]; then
+                printf '%s\n' \
+                    'installed linux-image-6.1.0-16-amd64-unsigned' \
+                    'installed linux-image-6.1.0-18-amd64-unsigned' \
+                    'installed linux-image-6.1.0-19-amd64-unsigned' \
+                    'installed linux-image-6.12.0-1-amd64-unsigned'
+            else
+                printf '%s\n' \
+                    'installed linux-image-6.1.0-17-amd64' \
+                    'installed linux-image-6.1.0-18-amd64' \
+                    'installed linux-image-6.1.0-19-amd64' \
+                    'installed linux-image-6.12.0-1-amd64' \
+                    'installed linux-image-6.1.0-15-cloud-amd64' \
+                    'installed linux-image-6.1.0-14-amd64-unsigned' \
+                    'config-files linux-image-6.1.0-16-amd64'
+            fi
+            ;;
+        *) return 1 ;;
+    esac
+}
+kernel_has_boot_files() { [[ "$kernel_fallback" == available ]]; }
+apt-get() {
+    if [[ "$1" == -s ]]; then
+        case "$apt_plan" in
+            expected) printf 'Purg %s [1]\n' "${!#}" ;;
+            unexpected) printf 'Purg %s [1]\nPurg linux-image-cloud-amd64 [1]\n' "${!#}" ;;
+            reconfigure) printf 'Purg %s [1]\nConf another-package (1)\n' "${!#}" ;;
+            unknown) printf 'Unknown operation %s\n' "${!#}" ;;
+            failure) return 1 ;;
+        esac
+    else
+        printf '%s\n' "$*" >> "$apt_log"
+    fi
+}
+
+[[ $(kernel_package_flavour linux-image-6.12.86+deb13.1-cloud-amd64) == cloud-amd64 ]]
+[[ $(kernel_package_flavour linux-image-6.1.0-18-amd64-unsigned) == amd64 ]]
+remove_old_kernels <<< y
+[[ $(cat "$apt_log") == *'purge -- linux-image-6.1.0-17-amd64' ]]
+[[ $(cat "$apt_log") == *'APT::Get::Assume-Yes=false'* ]]
+: > "$apt_log"
+kernel_case=unsigned
+remove_old_kernels <<< y
+[[ $(cat "$apt_log") == *'purge -- linux-image-6.1.0-16-amd64-unsigned' ]]
+: > "$apt_log"
+kernel_case=known
+remove_old_kernels <<< n
+[[ ! -s "$apt_log" ]]
+for rejected_plan in unexpected reconfigure unknown failure; do
+    apt_plan="$rejected_plan"
+    if remove_old_kernels <<< y; then
+        printf 'Unsafe APT simulation accepted: %s\n' "$apt_plan" >&2
+        exit 1
+    fi
+    [[ ! -s "$apt_log" ]]
+done
+apt_plan=expected
+kernel_fallback=missing
+remove_old_kernels <<< y
+[[ ! -s "$apt_log" ]]
+kernel_fallback=available
+for kernel_case in unknown multiple_owners container; do
+    remove_old_kernels <<< y
+    upgrade_kernel_debian <<< y
+    [[ ! -s "$apt_log" ]]
+done
+kernel_case=known
+df() { printf 'Avail IFree\n250 5000\n'; }
+upgrade_kernel_debian <<< y
+[[ $(tail -n 1 "$apt_log") == '--no-remove install -y -- linux-image-amd64' ]]
+: > "$apt_log"
+df() { printf 'Avail IFree\n250 0\n'; }
+if upgrade_kernel_debian <<< y; then
+    printf '%s\n' 'Kernel update did not stop on zero free inodes' >&2
+    exit 1
+fi
+[[ ! -s "$apt_log" ]]
+unset -f df systemd-detect-virt uname dpkg-query apt-get kernel_has_boot_files
+printf '%s\n' 'Kernel maintenance checks passed'
+
+read_socket_details() {
     cat <<'EOF'
 0 0 192.0.2.1:443 198.51.100.1:50000
     cubic rtt:100/10 cwnd:10
@@ -70,16 +200,18 @@ ss() {
     cubic rtt:0.001/0.001
 EOF
 }
-[[ $(ss | parse_socket_rtts | rtt_summary) == '5 200.000 250.000' ]] || fail 'RTT parsing/loopback exclusion'
-[[ $(printf '' | parse_socket_rtts | rtt_summary) == '0 0 0' ]] || fail 'empty RTT parsing'
+[[ $(read_socket_details | parse_socket_rtts 512 | rtt_summary) == '5 200.000 250.000' ]] || fail 'RTT parsing/loopback exclusion'
+[[ $(printf '' | parse_socket_rtts 512 | rtt_summary) == '0 0 0' ]] || fail 'empty RTT parsing'
+[[ $(printf '10\n90\n' | rtt_summary) == '2 50.000 90.000' ]] || fail 'incorrect median for even samples'
+[[ $(read_socket_details | parse_socket_rtts 2 | rtt_summary) == '2 125.000 150.000' ]] || fail 'RTT sample limit ignored'
 effective_memory() { echo '2048 600'; }
 ip() { return 0; }
 tc() { return 0; }
 detect_network
 [[ "$DETECT_SAMPLES $DETECT_MEDIAN_MS $DETECT_P75_MS" == '5 200.000 250.000' ]] || fail 'diagnostic result'
-ss() { return 1; }
+read_socket_details() { return 124; }
 detect_network
-[[ "$DETECT_SAMPLES" == 0 ]] || fail 'ss failure not handled'
+[[ "$DETECT_SAMPLES" == 0 ]] || fail 'ss timeout not handled'
 sysctl() {
     if [[ "$1" == -n ]]; then
         [[ ${AUTO_MODE:-ok} != unreadable ]] || return 1
@@ -128,7 +260,7 @@ if apply_auto_tcp_plan "$plan" "$tmp/conf/auto.conf" "$tmp/save-failure" < /dev/
 unset -f mv
 
 # The menu action must not read stdin or require user-supplied measurements.
-detect_network() { echo 'mock diagnostics'; }
+detect_network() { fail 'menu option 2 triggered network diagnostics'; }
 apply_auto_tcp_plan() { printf '%s\n' "$1" >> "$tmp/menu-applies"; }
 echo 0 > "$tmp/auto-state"
 tcp_tune < /dev/null
@@ -140,4 +272,17 @@ tcp_tune < /dev/null
 AUTO_MODE=unreadable
 tcp_tune < /dev/null
 [[ ! -s "$tmp/menu-applies" ]] || fail 'unreadable value not skipped by menu'
-echo 'PASS: OS, kernel safety, RTT diagnostics, zero-input tuning, skip cases and rollback'
+
+# Ordinary redraws reuse status; explicit refresh fetches a new snapshot.
+show_status() { printf "status\n" >> "$tmp/status-calls"; }
+detect_network() { printf "diagnostics\n" >> "$tmp/diagnostic-calls"; }
+show_menu > "$tmp/menu-output" <<'EOF'
+invalid
+5
+
+0
+EOF
+[[ $(wc -l < "$tmp/status-calls") == 2 ]] || fail 'menu did not reuse cached status or refresh exactly once'
+[[ $(wc -l < "$tmp/diagnostic-calls") == 1 ]] || fail 'explicit diagnostics did not run once'
+grep -Fq "已退出" "$tmp/menu-output" || fail 'menu refresh did not return to the input prompt'
+echo 'PASS: OS, BBR and TCP rollback, kernel safety, RTT diagnostics and menu refresh'
