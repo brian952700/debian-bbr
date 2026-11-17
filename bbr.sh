@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin:~/bin
+PATH=/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/sbin:/usr/local/bin
 export PATH
 
 #=================================================
 #   System  : Debian 12 / 13 and later
 #   Desc    : BBR一键加速 + TCP深度调优
-#   Version : 3.3.0-debian
+#   Version : 3.4.0-debian
 #   Author  : VPS值得买
 #   测评网站    : https://vpszdm.com
 #=================================================
@@ -28,7 +28,7 @@ ui_init() {
 }
 ui_init
 
-sh_ver="3.3.0-debian"
+sh_ver="3.4.0-debian"
 
 ui_log() { printf '  %s[%s]%s %s\n' "$1" "$2" "$PLAIN" "$3"; }
 info()  { ui_log "$BLUE" '信息' "$*"; }
@@ -39,15 +39,14 @@ error() { ui_log "$RED" '失败' "$*"; }
 die()   { error "$*"; exit 1; }
 
 hr() {
-    local width=68 i
+    local width=68 line
     if [[ ${UI_COLUMNS:-} =~ ^[0-9]{2,3}$ ]]; then
         width=$((10#$UI_COLUMNS - 4))
         if (( width < 32 )); then width=32; fi
         if (( width > 68 )); then width=68; fi
     fi
-    printf '  %s' "$DIM"
-    for (( i=0; i<width; i++ )); do printf '─'; done
-    printf '%s\n' "$PLAIN"
+    printf -v line '%*s' "$width" ''
+    printf '  %s%s%s\n' "$DIM" "${line// /─}" "$PLAIN"
 }
 
 ui_detail() { printf '         %s\n' "$*"; }
@@ -99,19 +98,11 @@ check_system() {
     ARCH=$(uname -m)
 }
 
-backup_file() {
-    local file="$1"
-    [[ -e "$file" ]] || return 0
-    local backup_dir
-    backup_dir=$(mktemp -d /var/backups/debian-bbr.XXXXXXXX) || return 1
-    cp -a -- "$file" "$backup_dir/" || return 1
-    info "原配置已备份到 $backup_dir/"
-}
-
 # ────────────────────────── 依赖检查与安装 ──────────────────────────
 check_dependencies() {
     local deps=()
     command -v sysctl &>/dev/null || deps+=(procps)
+    command -v flock &>/dev/null || deps+=(util-linux)
     if ! command -v ip &>/dev/null || ! command -v ss &>/dev/null || ! command -v tc &>/dev/null; then
         deps+=(iproute2)
     fi
@@ -119,6 +110,48 @@ check_dependencies() {
         info "正在安装缺少的依赖：${deps[*]}"
         ui_detail "软件包管理器输出如下；完成后会自动继续。"
         apt-get update && apt-get install -y "${deps[@]}" || return 1
+    fi
+}
+
+# 只锁定写入操作。锁随子 shell 退出释放，避免两个会话互相覆盖备份。
+with_sysctl_lock() (
+    local lock_fd
+    exec {lock_fd}>>/run/debian-bbr-sysctl.lock || { error '无法打开配置锁'; return 1; }
+    flock -n "$lock_fd" || { warn '配置操作暂不可用，请稍后再试'; return 1; }
+    "$@"
+)
+
+# 使用 systemd 的实际文件顺序，报告最后一条可能覆盖本次设置的规则。
+warn_sysctl_conflicts() {
+    local conf_file="$1" key="$2" expected="$3" config override
+    [[ -x /lib/systemd/systemd-sysctl ]] || return 0
+    config=$(/lib/systemd/systemd-sysctl --cat-config --no-pager 2>/dev/null) || return 0
+    override=$(LC_ALL=C awk -v target="${conf_file##*/}" -v key="$key" -v expected="$expected" '
+        /^# \// {
+            file=substr($0,3)
+            name=file
+            sub(/^.*\//,"",name)
+            next
+        }
+        name > target && index($0,"=") {
+            split_at=index($0,"=")
+            setting=substr($0,1,split_at-1)
+            value=substr($0,split_at+1)
+            gsub(/[[:space:]]/,"",setting)
+            sub(/^-/,"",setting)
+            gsub(/\//,".",setting)
+            sub(/^[[:space:]]+/,"",value)
+            sub(/[[:space:]]+$/,"",value)
+            if (setting==key) {
+                last_file=file
+                last_value=value
+            }
+        }
+        END {if (last_file!="" && last_value!=expected) print last_file " (" last_value ")"}
+    ' <<< "$config")
+    if [[ -n "$override" ]]; then
+        warn "启动时 $key 可能被后加载的配置覆盖"
+        ui_detail "$override"
     fi
 }
 
@@ -144,149 +177,153 @@ check_virt() {
         warn '检测到 OpenVZ 容器，内核由宿主机管理。'
         ui_detail 'BBR 是否可用取决于宿主机支持与容器权限。'
         ui_detail '本脚本可能无法修改相关参数。'
-        read -rp "$(ui_prompt '仍要继续吗？[y/N]：')" continue_openvz
-        [[ ! "$continue_openvz" =~ ^[Yy]$ ]] && exit 1
     fi
 }
 
-# ────────────────────────── /boot 空间检查 ──────────────────────────
-check_boot_space() {
-    hr
-    info "检查 /boot 分区空间..."
-    local boot_available
-    boot_available=$(df -m /boot 2>/dev/null | tail -1 | awk '{print $4}')
+# 恢复单项运行值。未发生变化时避免无谓的写入。
+restore_bbr_setting() {
+    local key="$1" before="$2" current
+    current=$(sysctl -n "$key" 2>/dev/null) || current=''
+    [[ "$current" == "$before" ]] && return 0
+    if ! sysctl -w "$key=$before" >/dev/null 2>&1 ||
+       [[ $(sysctl -n "$key" 2>/dev/null) != "$before" ]]; then
+        error "恢复 $key 失败，请检查运行值。"
+        return 1
+    fi
+}
 
-    if [[ -n "$boot_available" ]]; then
-        if [[ $boot_available -lt 100 ]]; then
-            warn "/boot 空间不足（可用: ${boot_available}MB），建议清理旧内核后再继续"
-            read -rp "$(ui_prompt '仍要继续吗？[y/N]：')" continue_boot
-            [[ ! "$continue_boot" =~ ^[Yy]$ ]] && exit 1
+# 在子 shell 内管理临时文件和回滚，避免影响其他菜单项的信号处理。
+enable_bbr() (
+    local conf_file="${1:-/etc/sysctl.d/99-bbr.conf}" backup_root="${2:-/var/backups}"
+    local cc_key=net.ipv4.tcp_congestion_control qdisc_key=net.core.default_qdisc
+    local before_cc before_qdisc staged state_dir apply_error
+    local changed_cc=0 changed_qdisc=0 fq_verified=0
+
+    before_cc=$(sysctl -n "$cc_key" 2>/dev/null) || before_cc=''
+    [[ -n "$before_cc" ]] || { error '无法读取当前拥塞控制，已跳过 BBR 配置。'; exit 1; }
+    before_qdisc=$(sysctl -n "$qdisc_key" 2>/dev/null) || before_qdisc=''
+    if [[ -L "$conf_file" || ( -e "$conf_file" && ! -f "$conf_file" ) ]]; then
+        error "配置路径不是普通文件：$conf_file"
+        exit 1
+    fi
+
+    mkdir -p -- "$(dirname -- "$conf_file")" || exit 1
+    staged=$(mktemp -- "${conf_file}.XXXXXXXX") || exit 1
+    # 同目录原子替换成功后，临时文件路径即不存在。
+    trap 'if [[ -e "$staged" ]]; then
+        if (( changed_qdisc )); then restore_bbr_setting "$qdisc_key" "$before_qdisc" || true; fi
+        if (( changed_cc )); then restore_bbr_setting "$cc_key" "$before_cc" || true; fi
+        rm -f -- "$staged"
+    fi' EXIT
+    trap 'exit 130' INT
+    trap 'exit 129' HUP
+    trap 'exit 143' TERM
+
+    if [[ -f "$conf_file" ]]; then
+        # 只替换本操作涉及的两项，保留旧版文件中的其他设置。
+        awk '
+            /^[[:space:]]*-?[[:space:]]*net[.\/]ipv4[.\/]tcp_congestion_control[[:space:]]*=/ {next}
+            /^[[:space:]]*-?[[:space:]]*net[.\/]core[.\/]default_qdisc[[:space:]]*=/ {next}
+            {print}
+        ' "$conf_file" > "$staged" || exit 1
+    else
+        printf '# Debian BBR\n' > "$staged" || exit 1
+    fi
+    printf '%s = bbr\n' "$cc_key" >> "$staged" || exit 1
+    if [[ "$before_qdisc" == fq ]]; then
+        fq_verified=1
+        printf '%s = fq\n' "$qdisc_key" >> "$staged" || exit 1
+    fi
+
+    if [[ "$before_cc" == bbr && ( "$before_qdisc" == fq || -z "$before_qdisc" ) ]] &&
+       cmp -s -- "$staged" "$conf_file"; then
+        ok 'BBR 已启用，持久配置无需更新。'
+        if (( fq_verified )); then
+            ok '默认队列已设置为 fq。'
+            warn_sysctl_conflicts "$conf_file" "$qdisc_key" fq || true
         else
-            ok "/boot 空间充足（可用: ${boot_available}MB）"
+            skip '无法读取默认队列，已保留当前设置。'
+        fi
+        warn_sysctl_conflicts "$conf_file" "$cc_key" bbr || true
+        exit 0
+    fi
+
+    mkdir -p -- "$backup_root" || exit 1
+    state_dir=$(mktemp -d -- "$backup_root/debian-bbr.XXXXXXXX") || exit 1
+    if [[ -f "$conf_file" ]]; then
+        cp -a -- "$conf_file" "$state_dir/" || exit 1
+    else
+        touch -- "$state_dir/no-previous-config" || exit 1
+    fi
+    {
+        printf '%s = %s\n' "$cc_key" "$before_cc"
+        if [[ -n "$before_qdisc" ]]; then printf '%s = %s\n' "$qdisc_key" "$before_qdisc"; fi
+    } > "$state_dir/runtime-before.conf" || exit 1
+    info "备份目录：$state_dir"
+
+    if [[ "$before_cc" != bbr ]]; then
+        changed_cc=1
+        if ! apply_error=$(sysctl -w "$cc_key=bbr" 2>&1) ||
+           [[ $(sysctl -n "$cc_key" 2>/dev/null) != bbr ]]; then
+            error '当前内核未能启用 BBR，请检查模块和容器权限。'
+            [[ -z "$apply_error" ]] || ui_detail "$apply_error"
+            exit 1
         fi
     fi
-}
 
-# ────────────────────────── BBR 状态检测 ──────────────────────────
-check_bbr_status() {
-    local cc
-    cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
-    [[ "$cc" == "bbr" ]]
-}
-
-# ────────────────────────── 内核版本检测 ──────────────────────────
-check_kernel_native_bbr() {
-    local kver major minor
-    kver=$(uname -r | cut -d- -f1)
-    major=$(echo "$kver" | cut -d. -f1)
-    minor=$(echo "$kver" | cut -d. -f2)
-
-    if [[ $major -gt 5 ]] || [[ $major -eq 5 && $minor -ge 4 ]]; then
-        ok "内核 ${kver} 原生支持 BBR（最佳）"
-        return 0
-    elif [[ $major -eq 4 && $minor -ge 9 ]] || [[ $major -ge 5 ]]; then
-        warn "内核 ${kver} 支持 BBR（建议升级到 5.4+）"
-        return 0
-    else
-        error "内核 ${kver} 不支持 BBR，需要升级内核"
-        return 1
-    fi
-}
-
-# ────────────────────────── sysctl 兼容写入（兼容 LXC/容器）──────────────────────────
-# 优先用 sysctl -w 逐条写入，避免 sysctl -p 在容器内遇到不支持的参数时中途退出
-sysctl_apply_file() {
-    local conf_file="$1"
-    [[ -r "$conf_file" ]] || { error "无法读取 $conf_file"; return 1; }
-    local skipped=0
-
-    while IFS= read -r line; do
-        # 跳过注释行和空行
-        [[ "$line" =~ ^[[:space:]]*# ]] && continue
-        [[ -z "${line// }" ]] && continue
-
-        # 提取 key=value（key 去除所有空格，value 仅去除首尾空白，保留中间空格）
-        local key value
-        key=$(echo "$line" | cut -d= -f1 | tr -d ' ')
-        value=$(echo "$line" | cut -d= -f2- | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//')
-        [[ -z "$key" || -z "$value" ]] && continue
-
-        # 尝试写入，捕获错误
-        local err
-        if ! err=$(sysctl -w "${key}=${value}" 2>&1); then
-            # 报告失败并继续处理其他参数（容器内常见）
-            warn "跳过不支持的参数: ${key} (${err})"
-            skipped=$((skipped + 1))
+    if [[ -n "$before_qdisc" && "$before_qdisc" != fq ]]; then
+        changed_qdisc=1
+        if apply_error=$(sysctl -w "$qdisc_key=fq" 2>&1) &&
+           [[ $(sysctl -n "$qdisc_key" 2>/dev/null) == fq ]]; then
+            fq_verified=1
+            printf '%s = fq\n' "$qdisc_key" >> "$staged" || exit 1
+        else
+            restore_bbr_setting "$qdisc_key" "$before_qdisc" || exit 1
+            changed_qdisc=0
+            skip 'fq 未能生效，保留原默认队列。'
+            [[ -z "$apply_error" ]] || ui_detail "$apply_error"
         fi
-    done < "$conf_file"
-
-    (( skipped == 0 ))
-}
-
-# ────────────────────────── 启用 BBR ──────────────────────────
-enable_bbr() {
-    hr
-    check_kernel_native_bbr || { warn "请先升级内核再启用 BBR"; return 1; }
-
-    info "正在写入 BBR 配置..."
-
-    backup_file /etc/sysctl.d/99-bbr.conf || return 1
-    mkdir -p /etc/sysctl.d || return 1
-    cat > /etc/sysctl.d/99-bbr.conf <<'EOF' || return 1
-# ── BBR 拥塞控制 ──
-net.core.default_qdisc         = fq
-net.ipv4.tcp_congestion_control = bbr
-
-
-EOF
-
-    # 使用兼容方式逐条写入（兼容 LXC/Docker 等容器环境）
-    sysctl_apply_file /etc/sysctl.d/99-bbr.conf || warn "部分配置未生效，请查看上面的错误"
-
-    # 兜底：强制写入最关键的两条
-    sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 || true
-    sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1 || true
-
-    if check_bbr_status; then
-        printf '\n'
-        ok 'BBR 已启用'
-        ui_detail '配置已保存，实际网络表现请从客户端验证。'
-    else
-        echo ""
-        error "BBR 启用失败，当前环境可能不支持修改拥塞控制算法"
-        echo ""
-        echo -e "${YELLOW}  可能原因：${PLAIN}"
-        echo "    1. LXC/OpenVZ 容器且宿主机未授予 net_admin 权限"
-        echo "    2. 内核未编译 BBR 模块（运行: modprobe tcp_bbr 验证）"
-        echo "    3. 容器平台锁定了该参数"
-        echo ""
-        echo -e "${YELLOW}  手动验证命令：${PLAIN}"
-        echo "    modprobe tcp_bbr && echo ok"
-        echo "    echo bbr > /proc/sys/net/ipv4/tcp_congestion_control"
-        echo "    sysctl net.ipv4.tcp_congestion_control"
-        return 1
     fi
-}
+
+    if ! chmod 644 -- "$staged" || ! mv -fT -- "$staged" "$conf_file"; then
+        error '保存 BBR 配置失败，正在恢复运行值。'
+        exit 1
+    fi
+    ok 'BBR 已启用并保存。'
+    warn_sysctl_conflicts "$conf_file" "$cc_key" bbr || true
+    if (( fq_verified )); then
+        ok '默认队列已设置为 fq。'
+        warn_sysctl_conflicts "$conf_file" "$qdisc_key" fq || true
+    elif [[ -z "$before_qdisc" ]]; then
+        skip '无法读取默认队列，已保留当前设置。'
+    fi
+)
 
 # 只读诊断：不测速、不扫描第三方节点、不读取代理账号或证书。
 parse_socket_rtts() {
-    awk '
+    awk -v limit="$1" '
         /^[^ \t]/ && !/rtt:/ {
             skip = ($0 ~ /(^|[ \t])(127\.|\[?::1\]?:|\[?::ffff:127\.)/)
             next
         }
-        !skip {
+        !skip && count < limit {
             for (i=1; i<=NF; i++) if ($i ~ /^rtt:[0-9]/) {
                 split($i, p, ":"); split(p[2], r, "/")
-                if (r[1]+0 > 0) print r[1]+0
+                if (r[1]+0 > 0) {
+                    print r[1]+0
+                    count++
+                    break
+                }
             }
         }'
 }
 
 rtt_summary() {
     sort -n | awk '{a[NR]=$1} END {
-        if (NR) printf "%d %.3f %.3f\n", NR, a[int((NR+1)/2)], a[int((NR*3+3)/4)]
-        else print "0 0 0"
+        if (NR) {
+            middle = (a[int((NR+1)/2)] + a[int(NR/2)+1])/2
+            printf "%d %.3f %.3f\n", NR, middle, a[int((NR*3+3)/4)]
+        } else print "0 0 0"
     }'
 }
 
@@ -317,8 +354,13 @@ effective_memory() {
     printf '%s %s\n' "$total" "$available"
 }
 
+read_socket_details() {
+    timeout --kill-after=1s 3s ss -Htin state established
+}
+
 detect_network() {
-    local dev="" speed="" sample queues rxdrop txdrop
+    local dev="" speed="" summary queues rxdrop txdrop
+    local max_samples=512
     read -r DETECT_TOTAL_MIB DETECT_FREE_MIB < <(effective_memory)
     ui_kv '有效内存' "${DETECT_TOTAL_MIB} MiB（当前可用约 ${DETECT_FREE_MIB} MiB）"
     ui_kv 'CPU 核心' "$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 未知)"
@@ -345,16 +387,23 @@ detect_network() {
     fi
     printf '\n'
     info '读取现有 TCP 连接摘要'
-    if sample=$(ss -Htin state established 2>/dev/null); then
-        read -r DETECT_SAMPLES DETECT_MEDIAN_MS DETECT_P75_MS < <(printf '%s\n' "$sample" | parse_socket_rtts | rtt_summary)
+    if summary=$(
+        set -o pipefail
+        export LC_ALL=C
+        read_socket_details 2>/dev/null | parse_socket_rtts "$max_samples" | rtt_summary
+    ); then
+        read -r DETECT_SAMPLES DETECT_MEDIAN_MS DETECT_P75_MS <<< "$summary"
     else
         DETECT_SAMPLES=0 DETECT_MEDIAN_MS=0 DETECT_P75_MS=0
-        warn "ss 读取失败，按无样本处理"
+        warn 'TCP 连接读取超时或失败，略过 RTT 摘要'
     fi
     if (( DETECT_SAMPLES > 0 )); then
         ui_kv '连接样本' "${DETECT_SAMPLES} 个（排除回环）"
         ui_kv 'RTT 摘要' "中位数 ${DETECT_MEDIAN_MS} ms / P75 ${DETECT_P75_MS} ms"
-        ui_detail '全机连接快照，仅作诊断，不用于估算线路带宽。'
+        if (( DETECT_SAMPLES == max_samples )); then
+            ui_detail "显示前 $max_samples 个有效样本。"
+        fi
+        ui_detail '全机连接快照，仅作诊断。'
     else
         skip '暂无可用 RTT 样本，继续执行可判断的项目'
     fi
@@ -375,6 +424,10 @@ apply_auto_tcp_plan() {
     local before state_dir staged apply_error
     before=$(sysctl -n net.ipv4.tcp_moderate_rcvbuf 2>/dev/null) || { warn "参数已不可读，跳过"; return 0; }
     [[ "$before" == 0 ]] || { info "参数已变化或已经开启，跳过"; return 0; }
+    if [[ -L "$conf_file" || ( -e "$conf_file" && ! -f "$conf_file" ) ]]; then
+        error "配置路径不是普通文件：$conf_file"
+        return 1
+    fi
     mkdir -p -- "$backup_root" "$(dirname "$conf_file")" || return 1
     state_dir=$(mktemp -d "$backup_root/debian-bbr-auto.XXXXXXXX") || return 1
     if [[ -e "$conf_file" ]]; then
@@ -402,7 +455,7 @@ apply_auto_tcp_plan() {
         warn "无法验证参数生效，未保存持久配置"
         return 1
     fi
-    if ! mv -f -- "$staged" "$conf_file"; then
+    if ! mv -fT -- "$staged" "$conf_file"; then
         sysctl -w "net.ipv4.tcp_moderate_rcvbuf=$before" >/dev/null 2>&1 || warn "运行值恢复失败，请检查系统限制"
         rm -f -- "$staged"
         return 1
@@ -412,6 +465,7 @@ apply_auto_tcp_plan() {
     info "配置已保存，备份已完成"
     ui_detail "配置：$conf_file"
     ui_detail "备份：$state_dir"
+    warn_sysctl_conflicts "$conf_file" net.ipv4.tcp_moderate_rcvbuf 1
     printf '\n'
     ui_detail '需要恢复时，可执行以下命令：'
     ui_detail "sysctl -p $state_dir/runtime-before.conf"
@@ -419,73 +473,215 @@ apply_auto_tcp_plan() {
 }
 
 tcp_tune() {
-    ui_step 1 3 '自动检测服务器环境'
-    detect_network
     local plan
-    ui_step 2 3 '判断可自动适配的项目'
+    ui_step 1 2 '检查接收缓冲区自动调节'
     plan=$(build_auto_tcp_plan) || return 1
-    skip '线路带宽与连接拓扑：无法可靠判断，保持现状'
     if [[ -f /etc/sysctl.d/99-tcp-tune.conf ]]; then
         warn "发现旧版调优配置；本次保留，旧参数不会自动恢复。恢复方法见 README。"
     fi
     if [[ -z "$plan" ]]; then
-        ui_step 3 3 '执行结果'
+        ui_step 2 2 '执行结果'
         skip '无需调整：参数已开启，或系统不支持可靠检测'
         ui_detail '本次未写入配置。'
         return 0
     fi
-    ui_step 3 3 '备份并应用自动适配'
+    ui_step 2 2 '备份并应用自动适配'
     info '检测到接收缓冲区自动调节已关闭，正在开启'
     apply_auto_tcp_plan "$plan" /etc/sysctl.d/99-tcp-auto.conf /var/backups
 }
 
-# 仅使用当前 Debian 已配置的软件源，不更换源，不安装第三方内核。
-upgrade_kernel_debian() {
-    local arch package
-    arch=$(dpkg --print-architecture)
-    case "$arch" in
-        amd64|arm64|riscv64|s390x) package="linux-image-$arch" ;;
-        armhf) package="linux-image-armmp" ;;
-        i386) package="linux-image-686-pae" ;;
-        ppc64el) package="linux-image-powerpc64le" ;;
-        *) error "架构 $arch 未配置自动内核升级，请使用发行版对应内核包"; return 1 ;;
+# Debian 内核维护。只有能识别正在运行的 Debian 内核包时才操作。
+kernel_maintenance_available() {
+    if command -v systemd-detect-virt &>/dev/null && systemd-detect-virt --container --quiet; then
+        warn '容器共享宿主机内核，跳过内核维护。'
+        return 1
+    fi
+    case "${virt_type:-}" in
+        openvz|lxc|lxc-libvirt|docker|podman|systemd-nspawn|wsl|proot|rkt|pouch)
+            warn '容器共享宿主机内核，跳过内核维护。'
+            return 1
+            ;;
     esac
-    info "将从当前软件源安装/更新 $package。已有云厂商定制内核时请先确认兼容性。"
-    local confirm
+    return 0
+}
+
+kernel_current_package() {
+    local release image owner
+    release=$(uname -r) || return 1
+    image="/boot/vmlinuz-$release"
+    owner=$(dpkg-query -S -- "$image" 2>/dev/null) || return 1
+    # Reject multiple owners/diversions and require an exact path match.
+    [[ "$owner" != *$'\n'* && "$owner" == *": $image" ]] || return 1
+    owner="${owner%": $image"}"
+    owner="${owner%%:*}"
+    case "$owner" in
+        "linux-image-$release"|"linux-image-$release-unsigned") printf '%s\n' "$owner" ;;
+        *) return 1 ;;
+    esac
+}
+
+kernel_package_flavour() {
+    local name="${1%-unsigned}"
+    # Debian 12: 6.1.0-34-amd64. Debian 13: 6.12.86+deb13-cloud-amd64.
+    [[ "$name" =~ ^linux-image-[0-9]+(\.[0-9]+)+(-[0-9]+|\+deb[0-9]+(\.[0-9]+)*)?-(.+)$ ]] || return 1
+    case "${BASH_REMATCH[4]}" in
+        amd64|cloud-amd64|rt-amd64|arm64|arm64-16k|cloud-arm64|rt-arm64|armmp|armmp-lpae|rt-armmp|686|686-pae|riscv64|s390x|powerpc64le|powerpc64le-64k)
+            printf '%s\n' "${BASH_REMATCH[4]}"
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+kernel_check_boot_space() {
+    local space mib inodes
+    if ! space=$(LC_ALL=C df -m --output=avail,iavail /boot 2>/dev/null); then
+        error '无法读取 /boot 的剩余空间，本次升级已停止。'
+        return 1
+    fi
+    read -r mib inodes < <(printf '%s\n' "$space" | awk 'NR == 2 { print $1, $2 }')
+    if [[ ! "$mib" =~ ^[0-9]+$ || ! "$inodes" =~ ^[0-9]+$ ]]; then
+        error '无法确认 /boot 剩余空间或 inode，本次升级已停止。'
+        return 1
+    fi
+    info "/boot 当前可用 ${mib} MiB，剩余 inode ${inodes}。"
+    if (( mib < 100 || inodes == 0 )); then
+        warn '/boot 可用空间不足，本次升级已停止。'
+        return 1
+    fi
+}
+
+upgrade_kernel_debian() {
+    local current flavour package confirm
+    kernel_maintenance_available || return 0
+    if ! current=$(kernel_current_package) || ! flavour=$(kernel_package_flavour "$current"); then
+        warn '无法识别当前内核类型，跳过自动升级。'
+        return 0
+    fi
+    package="linux-image-$flavour"
+    if [[ "$current" == *-unsigned ||
+          $(dpkg-query -W -f='${db:Status-Status}' -- "$package" 2>/dev/null) != installed ]]; then
+        warn '无法确认已安装、且与当前内核匹配的升级元包，跳过自动升级。'
+        return 0
+    fi
+    info "将通过当前软件源更新已安装的 $package。"
     read -rp "$(ui_prompt '确认更新内核？[y/N]：')" confirm
     [[ "$confirm" =~ ^[Yy]$ ]] || return 0
-    check_boot_space
-    apt-get update && apt-get install -y "$package" || { error "内核更新失败"; return 1; }
-    ok "内核包安装完成；如安装了新内核，请在维护窗口重启后再次检查 BBR。"
+    kernel_check_boot_space || return 1
+    apt-get update && apt-get --no-remove install -y -- "$package" || { error '内核更新失败。'; return 1; }
+    ok '内核包处理完成。如安装了新内核，请安排重启后检查。'
+}
+
+kernel_has_boot_files() {
+    local release="${1#linux-image-}"
+    release="${release%-unsigned}"
+    [[ -s "/boot/vmlinuz-$release" && -s "/boot/initrd.img-$release" ]]
+}
+
+kernel_simulate_purge() {
+    local simulation action package rest
+    local -A expected=() planned=()
+    for package in "$@"; do expected["$package"]=1; done
+    if ! simulation=$(LC_ALL=C apt-get -s -o APT::Get::AutomaticRemove=false purge -- "$@" 2>&1); then
+        error 'APT 清理预检失败。'
+        ui_detail "$simulation"
+        return 1
+    fi
+    while read -r action package rest; do
+        case "$action" in
+            Remv|Purg)
+                package="${package%%:*}"
+                if [[ -z "$package" || ! ${expected[$package]+present} ]]; then
+                    error "APT 计划额外删除 ${package:-未知包}，清理已停止。"
+                    return 1
+                fi
+                planned["$package"]=1
+                ;;
+            Conf|Inst)
+                error "APT 计划安装或配置 ${package:-未知包}，清理已停止。"
+                return 1
+                ;;
+        esac
+    done <<< "$simulation"
+    for package in "$@"; do
+        if [[ ! ${planned[$package]+present} ]]; then
+            error "无法确认 APT 会清理 $package，清理已停止。"
+            return 1
+        fi
+    done
 }
 
 remove_old_kernels() {
-    local current package confirm
-    current="linux-image-$(uname -r)"
-    local kernels=() keep=() remove=()
-    mapfile -t kernels < <(dpkg-query -W -f='${db:Status-Status} ${binary:Package}\n' 'linux-image-[0-9]*' 2>/dev/null |
-        awk '$1 == "installed" {sub(/:[^:]+$/, "", $2); print $2}' | sort -V)
-    (( ${#kernels[@]} )) || { info "没有找到已安装的版本化内核包"; return 0; }
-    mapfile -t keep < <(printf '%s\n' "${kernels[@]}" | tail -n 2)
-    for package in "${kernels[@]}"; do
+    local current flavour package package_flavour installed state confirm fallback='' found_current=0
+    local -a kernels=() remove=()
+    kernel_maintenance_available || return 0
+    if ! current=$(kernel_current_package) || ! flavour=$(kernel_package_flavour "$current"); then
+        warn '无法确认当前内核对应的 Debian 软件包，跳过清理。'
+        return 0
+    fi
+    if ! installed=$(dpkg-query -W -f='${db:Status-Status} ${binary:Package}\n' 'linux-image-[0-9]*' 2>/dev/null); then
+        warn '无法读取已安装的内核包，跳过清理。'
+        return 0
+    fi
+    while read -r state package; do
+        [[ "$state" == installed ]] || continue
+        package="${package%%:*}"
+        package_flavour=$(kernel_package_flavour "$package") || continue
+        [[ "$package_flavour" == "$flavour" ]] || continue
+        # Preserve other kernel variants, including a different signing type.
+        if [[ "$current" == *-unsigned ]]; then
+            [[ "$package" == *-unsigned ]] || continue
+        else
+            [[ "$package" != *-unsigned ]] || continue
+        fi
+        [[ "$package" != "$current" ]] || found_current=1
+        kernels+=("$package")
+    done <<< "$installed"
+    if (( ! found_current )); then
+        warn '运行内核的软件包未处于已安装状态，跳过清理。'
+        return 0
+    fi
+    if (( ${#kernels[@]} <= 2 )); then
+        info '当前内核类型没有足够的版本可清理。'
+        return 0
+    fi
+    local -a sorted=()
+    mapfile -t sorted < <(printf '%s\n' "${kernels[@]}" | LC_ALL=C sort -Vu)
+    local index keep_from
+    keep_from=$(( ${#sorted[@]} - 2 ))
+    for (( index=0; index<${#sorted[@]}; ++index )); do
+        package="${sorted[index]}"
         [[ "$package" == "$current" ]] && continue
-        [[ "$package" == "${keep[0]}" || "$package" == "${keep[1]:-}" ]] && continue
-        remove+=("$package")
+        if (( index >= keep_from )); then
+            if kernel_has_boot_files "$package"; then fallback="$package"; fi
+        else
+            remove+=("$package")
+        fi
     done
-    (( ${#remove[@]} )) || { ok "无须清理：保留当前运行内核和最新两个内核包"; return 0; }
-    info "保留当前运行内核和最新两个内核包，将清理："
+    if (( ! ${#remove[@]} )); then
+        info '没有需要清理的内核包。'
+        return 0
+    fi
+    if [[ -z "$fallback" ]]; then
+        warn '在保留的内核中未找到完整的备用镜像和 initramfs，跳过清理。'
+        return 0
+    fi
+    kernel_simulate_purge "${remove[@]}" || return 1
+    info "保留当前内核 $current 及配有启动文件的备用内核 $fallback。"
+    info 'APT 预检通过，待清理软件包如下。'
     printf '  %s\n' "${remove[@]}"
-    read -rp "$(ui_prompt '确认删除列出的旧内核？[y/N]：')" confirm
+    read -rp "$(ui_prompt '进入 APT 删除确认？[y/N]：')" confirm
     [[ "$confirm" =~ ^[Yy]$ ]] || return 0
-    apt-get purge -y "${remove[@]}" || { error "部分内核清理失败"; return 1; }
-    ok "清理完成（未运行 autoremove）"
+    # Prompt again using the actual plan, since the simulation held no package lock.
+    apt-get -o APT::Get::AutomaticRemove=false -o APT::Get::Assume-Yes=false -o quiet=0 purge -- "${remove[@]}" ||
+        { error '内核清理已取消或失败。'; return 1; }
+    ok '内核清理完成。'
 }
 
 show_status() {
     local cc qdisc auto bbr_status auto_status
-    cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) || cc='不可读取'
-    qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null) || qdisc='不可读取'
-    auto=$(sysctl -n net.ipv4.tcp_moderate_rcvbuf 2>/dev/null) || auto='未知'
+    IFS= read -r cc 2>/dev/null < /proc/sys/net/ipv4/tcp_congestion_control || cc='不可读取'
+    IFS= read -r qdisc 2>/dev/null < /proc/sys/net/core/default_qdisc || qdisc='不可读取'
+    IFS= read -r auto 2>/dev/null < /proc/sys/net/ipv4/tcp_moderate_rcvbuf || auto='未知'
     if [[ "$cc" == bbr ]]; then
         bbr_status="${GREEN}已启用${PLAIN}"
     elif [[ "$cc" == '不可读取' ]]; then
@@ -512,31 +708,41 @@ show_status() {
     fi
 }
 
+render_menu() {
+    ui_section '系统概览'
+    show_status
+    ui_section '请选择操作'
+    printf '  %s1%s  开启 BBR\n' "$GREEN" "$PLAIN"
+    ui_detail '启用拥塞控制，并保存配置'
+    printf '\n  %s2%s  TCP 自动检测与适配  %s[无需设置]%s\n' "$GREEN" "$PLAIN" "$CYAN" "$PLAIN"
+    ui_detail '自动检测 · 能适配才调整 · 其余跳过'
+    printf '\n'
+    hr
+    printf '  %s3%s  更新 Debian 内核\n' "$CYAN" "$PLAIN"
+    printf '  %s4%s  清理旧内核\n' "$CYAN" "$PLAIN"
+    printf '  %s5%s  刷新状态与网络诊断\n' "$CYAN" "$PLAIN"
+    printf '  %s0%s  退出\n' "$DIM" "$PLAIN"
+}
+
 show_menu() {
-    local choice
+    local choice menu=''
     while true; do
-        ui_section '系统概览'
-        show_status
-        ui_section '请选择操作'
-        printf '  %s1%s  开启 BBR\n' "$GREEN" "$PLAIN"
-        ui_detail '启用拥塞控制，并保存配置'
-        printf '\n  %s2%s  TCP 自动检测与适配  %s[无需设置]%s\n' "$GREEN" "$PLAIN" "$CYAN" "$PLAIN"
-        ui_detail '自动检测 · 能适配才调整 · 其余跳过'
-        printf '\n'
-        hr
-        printf '  %s3%s  更新 Debian 内核\n' "$CYAN" "$PLAIN"
-        printf '  %s4%s  清理旧内核\n' "$CYAN" "$PLAIN"
-        printf '  %s5%s  查看当前状态\n' "$CYAN" "$PLAIN"
-        printf '  %s0%s  退出\n' "$DIM" "$PLAIN"
+        if [[ -z "$menu" ]]; then
+            menu=$(render_menu) || return 1
+        fi
+        printf '%s\n' "$menu"
         read -rp "$(ui_prompt '输入编号 [0–5]：')" choice || return 0
         case "$choice" in
-            1) run_action '开启 BBR' enable_bbr ;;
-            2) run_action 'TCP 自动检测与适配' tcp_tune ;;
+            1) run_action '开启 BBR' with_sysctl_lock enable_bbr ;;
+            2) run_action 'TCP 自动检测与适配' with_sysctl_lock tcp_tune ;;
             3) run_action '更新 Debian 内核' upgrade_kernel_debian ;;
             4) run_action '清理旧内核' remove_old_kernels ;;
-            5) ui_section '当前系统状态'; show_status ;;
+            5) run_action '网络诊断' detect_network ;;
             0) printf '\n'; info '已退出。配置结果已保留。'; printf '\n'; return 0 ;;
             *) warn '请输入 0 到 5 之间的编号。'; continue ;;
+        esac
+        case "$choice" in
+            1|2|5) menu='' ;;
         esac
         [[ "$choice" == 2 ]] && continue
         read -rp "$(ui_prompt '按 Enter 返回菜单…')" _ || return 0
@@ -544,6 +750,7 @@ show_menu() {
 }
 
 main() {
+    local virt_type
     banner
     ui_step 1 4 '检查系统版本'
     check_system
